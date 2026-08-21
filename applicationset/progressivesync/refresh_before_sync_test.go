@@ -25,9 +25,9 @@ import (
 var fixedNow = time.Date(2026, 8, 21, 12, 2, 27, 0, time.UTC)
 
 const (
-	chartsRepoURL   = "https://github.com/AirHelp/charts.git"
-	ahConfigRepoURL = "https://github.com/AirHelp/ah-config.git"
-	helmRepoURL     = "https://charts.example.com"
+	chartsRepoURL = "https://github.com/example-org/charts.git"
+	configRepoURL = "https://github.com/example-org/config.git"
+	helmRepoURL   = "https://charts.example.com"
 )
 
 // rolloutSources mirrors a typical multi-source Application: a chart repository plus a repository
@@ -35,7 +35,7 @@ const (
 func rolloutSources() []v1alpha1.ApplicationSource {
 	return []v1alpha1.ApplicationSource{
 		{RepoURL: chartsRepoURL, TargetRevision: "master", Chart: "generic-service"},
-		{RepoURL: ahConfigRepoURL, TargetRevision: "master", Path: "apps/payments"},
+		{RepoURL: configRepoURL, TargetRevision: "master", Path: "apps/payments"},
 	}
 }
 
@@ -104,8 +104,8 @@ func TestRefreshApplicationsBehindRollout(t *testing.T) {
 	newRevisions := []string{"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "2222222222222222222222222222222222222222"}
 
 	otherSources := []v1alpha1.ApplicationSource{
-		{RepoURL: "https://github.com/AirHelp/other-charts.git", TargetRevision: "main", Chart: "generic-service"},
-		{RepoURL: ahConfigRepoURL, TargetRevision: "production", Path: "apps/payments"},
+		{RepoURL: "https://github.com/example-org/other-charts.git", TargetRevision: "main", Chart: "generic-service"},
+		{RepoURL: configRepoURL, TargetRevision: "production", Path: "apps/payments"},
 	}
 
 	for _, cc := range []struct {
@@ -391,7 +391,7 @@ func TestApplicationSourceKeys(t *testing.T) {
 	multiSource := newRolloutApp("multi", rolloutSources(), nil, nil)
 	assert.Equal(t, []string{
 		chartsRepoURL + "\x00master\x00generic-service\x00",
-		ahConfigRepoURL + "\x00master\x00\x00",
+		configRepoURL + "\x00master\x00\x00",
 	}, applicationSourceKeys(&multiSource))
 
 	singleSource := v1alpha1.Application{
@@ -418,8 +418,8 @@ func TestApplicationSourceKeys(t *testing.T) {
 	untagged := newRolloutApp("untagged", []v1alpha1.ApplicationSource{{RepoURL: chartsRepoURL, TargetRevision: "1.0.*"}}, nil, nil)
 	assert.NotEqual(t, applicationSourceKeys(&tagged), applicationSourceKeys(&untagged), "tagPrefix filters which tags the constraint may resolve to")
 
-	otherPath := newRolloutApp("other-path", []v1alpha1.ApplicationSource{{RepoURL: ahConfigRepoURL, TargetRevision: "master", Path: "apps/billing"}}, nil, nil)
-	samePath := newRolloutApp("same-path", []v1alpha1.ApplicationSource{{RepoURL: ahConfigRepoURL, TargetRevision: "master", Path: "apps/payments"}}, nil, nil)
+	otherPath := newRolloutApp("other-path", []v1alpha1.ApplicationSource{{RepoURL: configRepoURL, TargetRevision: "master", Path: "apps/billing"}}, nil, nil)
+	samePath := newRolloutApp("same-path", []v1alpha1.ApplicationSource{{RepoURL: configRepoURL, TargetRevision: "master", Path: "apps/payments"}}, nil, nil)
 	assert.Equal(t, applicationSourceKeys(&otherPath), applicationSourceKeys(&samePath), "path changes what is rendered from a revision, not which revision is resolved")
 }
 
