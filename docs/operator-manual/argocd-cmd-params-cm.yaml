@@ -370,6 +370,8 @@ data:
   applicationsetcontroller.enable.git.submodule: "true"
   # Enables use of the Progressive Syncs capability
   applicationsetcontroller.enable.progressive.syncs: "false"
+  # Refuse to release the next RollingSync step while an Application in a later step has observed a revision the current step has not (default "true")
+  applicationsetcontroller.progressive.sync.revision.aware.gate: "true"
   # A list of glob patterns specifying where to look for ApplicationSet resources. (default is only the ns where the controller is installed)
   applicationsetcontroller.namespaces: "argocd,argocd-appsets-*"
   # Path of the self-signed TLS certificate for SCM/PR Gitlab Generator

@@ -60,6 +60,7 @@ When the ApplicationSet changes, the changes will be applied to each group of Ap
 - The `In` and `NotIn` operators must match at least one value to be considered true (OR behavior).
 - The `NotIn` operator has priority in the event that both a `NotIn` and `In` operator produce a match.
 - All Applications in each group must become Healthy before the ApplicationSet controller will proceed to update the next group of Applications.
+- In addition, a best-effort, time-bounded [revision-aware hold](#revision-aware-step-gating) withholds a later group while an earlier group's `Healthy` is known to belong to a different revision. It reduces how often a group is released against a revision an earlier group has not applied; it is not a guarantee that every group is Healthy for the same revision.
 - The number of simultaneous Application updates in a group will not exceed its `maxUpdate` parameter (default is 100%, unbounded).
 - RollingSync will capture external changes outside the ApplicationSet resource, since it relies on watching the OutOfSync status of the managed Applications.
 - RollingSync will force all generated Applications to have autosync disabled. Warnings are printed in the applicationset-controller logs for any Application specs with an automated syncPolicy enabled.
@@ -95,6 +96,69 @@ before proceeding to the next step.
 Once each batch of Applications reaches a `Healthy` status, the next batch is synced until all matched
 
 If there are any applications that don't match the listed expressions, they will not be synced by the RollingSync strategy and must be manually synced as describe above.
+
+##### Revision-aware step gating
+
+The Application controller refreshes each Application independently, so at the moment a step is
+evaluated an Application in an earlier step may not have been refreshed yet. It then still reports
+`Synced` against the previous commit, and its progressive sync status is still the `Healthy` it earned
+in the *previous* rollout. Releasing the next step on that reading starts a later step against a
+rollout the earlier step has not begun — which is how a RollingSync ends up updating two steps at once.
+
+The ApplicationSet controller therefore withholds the Applications in a *later* step while an
+Application in an *earlier* step reports `Healthy` for a set of revisions that differ from the ones an
+Application in that later step has observed while sitting in `Waiting`. `Waiting` is the status the
+controller assigns the moment it observes a revision or spec change, so it is the one status that
+proves the change has reached that Application.
+
+Two cases are deliberately not held back, because in both of them the comparison proves nothing and a
+hold would only add latency:
+
+- Applications resolving different Git coordinates (`repoURL`, `targetRevision`, `chart`, `tagPrefix`).
+  They are allowed to sit at different revisions indefinitely.
+- A later step whose Applications are not in `Waiting`. Nothing has been observed there that could be
+  raced. This is the common case of an Application that has simply not been refreshed yet.
+
+The comparison establishes that two Applications disagree about the revisions they have observed, not
+which of them is newer: an ApplicationSet status carries no commit ancestry, and the ApplicationSet
+controller resolves no revisions of its own. So one uncommon shape is also held: a later step in
+`Waiting` because its *generated spec* changed, while it still reports the previous commit and the
+earlier step has already moved to the new one. The bound below is what keeps that a delay rather than
+a problem.
+
+The hold is bounded at two minutes, measured from the **earliest** `Waiting` transition among the
+later-step Applications whose observed revisions differ from the step being waited on. Neither a
+sibling Application entering `Waiting` as its own refresh lands mid-hold nor the order in which the
+Applications happen to be listed can move that deadline.
+
+If no such `Waiting` transition carries a timestamp at all, the wave is released immediately with a
+warning naming that reason, rather than a fresh two-minute window being started. Every code path that
+moves an Application into `Waiting` records the transition time, so this is not reachable through
+normal operation — but the gate is re-evaluated on every requeue, so deriving a new window each time
+would withhold the step forever. A hold whose end cannot be computed is not a bounded hold, and this
+gate blocks only on what it can prove.
+
+That bound matters when a commit does not touch an earlier step's
+[`manifest-generate-paths`](../high_availability.md#manifest-paths-annotation): the earlier
+step's Application is then never refreshed for that commit, and from the ApplicationSet controller this
+is indistinguishable from a refresh that is merely late. Past the bound the step is released and a
+warning is logged, rather than the rollout stalling for as long as the Application controller's
+`timeout.reconciliation`. While a step is withheld the ApplicationSet is re-examined every ten seconds,
+because a revision-only change to an Application produces no watch event.
+
+The bound is per disagreement, not per rollout. A **new** commit reaching those later-step
+Applications changes their observed revisions, which stamps a new `Waiting` transition and starts a new
+two-minute window against the disagreement that commit created. A stream of commits landing on a later
+step faster than the bound, while an earlier step is never refreshed for any of them, can therefore
+keep that later step withheld for as long as the stream lasts. Every individual hold still expires and
+logs its release.
+
+This gating is enabled by default. It can be turned off, in one of these ways, which restores the
+previous behavior of gating purely on `Healthy`:
+
+1. Pass `--progressive-sync-revision-aware-gate=false` to the ApplicationSet controller args.
+1. Set `ARGOCD_APPLICATIONSET_CONTROLLER_PROGRESSIVE_SYNC_REVISION_AWARE_GATE=false` in the ApplicationSet controller environment variables.
+1. Set `applicationsetcontroller.progressive.sync.revision.aware.gate: "false"` in the Argo CD `argocd-cmd-params-cm` ConfigMap.
 
 ### Deletion Strategies
 
