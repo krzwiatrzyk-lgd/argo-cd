@@ -19,22 +19,18 @@ const (
 	// than this is indistinguishable from a wedged rollout to whoever is on call.
 	MaxRevisionConsensusTimeout = 10 * time.Minute
 
-	// revisionConsensusRequeueInterval is how often the ApplicationSet is re-examined while the
-	// decision is withheld. Polling is required rather than optional: shouldRequeueForApplication
-	// ignores Status.Sync.Revision(s), so an Application that refreshes into agreement without
-	// changing its sync or health status produces no watch event, and an ApplicationSet generated
-	// only by the cluster generator has no periodic requeue either. It also caps the wait once the
-	// Applications do agree, which is why it is much shorter than the timeout.
+	// revisionConsensusRequeueInterval polls while the decision is withheld, because the event that
+	// would clear it need not exist: shouldRequeueForApplication ignores Status.Sync.Revision(s), and a
+	// cluster-generated ApplicationSet has no periodic requeue. It is much shorter than the timeout so
+	// that agreement is acted on promptly rather than at the bound.
 	revisionConsensusRequeueInterval = 10 * time.Second
 )
 
-// sourceSlot identifies the coordinates one source slot of an Application resolves its revision
-// from. Two slots that agree on every field ask the same repository for the same requested
-// revision, so the revisions they resolve to have to agree as well. Anything that does not take
-// part in resolving a revision is deliberately absent: path, helm values, kustomize options and
-// plugin config change what is rendered, not which commit is rendered, and including them would
-// stop the gate comparing the per-cluster Applications it exists to compare. ref is absent for the
-// same reason - it is a local alias for a source, not part of its coordinates.
+// sourceSlot identifies the coordinates one source slot resolves its revision from. Two slots that
+// agree on every field ask the same repository for the same revision, so what they resolve to must
+// agree too. Anything that does not take part in resolving is absent -- path, ref, helm values,
+// kustomize options and plugin config change what is rendered, not which commit -- because keying on
+// them would hide the per-cluster Applications this gate exists to compare.
 type sourceSlot struct {
 	repoURL        string
 	targetRevision string
@@ -57,13 +53,10 @@ func (s sourceSlot) String() string {
 
 // observedRevisions reports the revision an Application last resolved for each of its source slots.
 //
-// Both halves are read from status.sync and never from the spec. status.sync.comparedTo and
-// status.sync.revisions are written by the same comparison in CompareAppState (controller/state.go:
-// one manifest response per source, appended in source order, then Revisions = manifestRevisions
-// and ComparedTo.Sources = sources), so they are index-aligned with each other. Pairing
-// spec.GetSources() against status.GetRevisions() instead would mis-pair coordinates and revisions
-// in precisely the window this gate exists to detect: the one where the spec has already moved and
-// the status has not.
+// Both halves come from status.sync, never from the spec. CompareAppState writes comparedTo.Sources
+// and revisions from the same comparison, in source order, so they are index-aligned. Pairing
+// spec.GetSources() against status.GetRevisions() would mis-pair coordinates and revisions in exactly
+// the window this gate detects: the spec has moved and the status has not.
 func observedRevisions(app *argov1alpha1.Application) map[sourceSlot]string {
 	var sources argov1alpha1.ApplicationSources
 	var revisions []string
@@ -110,13 +103,12 @@ func observedRevisions(app *argov1alpha1.Application) map[sourceSlot]string {
 	return observed
 }
 
-// revisionUnreliable reports whether an Application's status.sync cannot be trusted to advance. An
-// Application that cannot be compared against its source keeps reporting whatever revision it last
-// managed to resolve - or, for a single-source Application, the unresolved targetRevision it was
-// asked for - so waiting for it to agree with the others is waiting forever.
+// revisionUnreliable reports whether an Application's status.sync cannot be trusted to advance. One
+// that cannot be compared against its source keeps reporting whatever it last resolved, so waiting for
+// it to agree is waiting forever.
 //
-// Deliberately not isApplicationWithError: that predicate drives a Pending -> Progressing
-// transition, and adding ComparisonError to it would change behaviour unrelated to this gate.
+// Deliberately not isApplicationWithError: that predicate drives a Pending -> Progressing transition,
+// and widening it would change behaviour unrelated to this gate.
 func revisionUnreliable(app *argov1alpha1.Application) bool {
 	for _, condition := range app.Status.Conditions {
 		switch condition.Type {
@@ -179,27 +171,18 @@ func (c revisionConsensus) LogDetail() string {
 	return strings.Join(parts, " ")
 }
 
-// evaluateRevisionConsensus reports whether every Application this ApplicationSet manages that
-// draws from the same source coordinates has converged on the same resolved revision, and
-// therefore whether the controller is looking at a whole view of the world or a torn one.
+// evaluateRevisionConsensus reports whether every Application drawing from the same source
+// coordinates has converged on the same resolved revision -- that is, whether the controller is
+// looking at a whole view of the world or a torn one.
 //
-// The Application controller refreshes Applications independently, milliseconds apart. Until an
-// Application has been refreshed it still reports Synced and Healthy against the previous
-// revision, which is indistinguishable from having completed the current one. A RollingSync step
-// released on that reading starts against a revision an earlier step has never seen.
-//
-// now is passed in rather than read here: one clock read per reconciliation, none inside the
-// loops, and deterministic tests.
+// now is passed in rather than read here: one clock read per reconciliation, none inside the loops,
+// and deterministic tests.
 func evaluateRevisionConsensus(appset *argov1alpha1.ApplicationSet, applications []argov1alpha1.Application, appStepMap map[string]int, timeout time.Duration, now time.Time) revisionConsensus {
-	// The only promotion RollingSync makes is Waiting -> Pending, in
-	// UpdateApplicationSetApplicationStatusProgress. With no step-selected Application in Waiting
-	// there is nothing to withhold, so the gate stays out of the way entirely. That is not an
-	// optimisation: it is what stops an ApplicationSet whose Applications legitimately never agree
-	// from being gated for its whole life.
-	//
-	// Applications no step selects are excluded here, and from the anchor below, because nothing
-	// ever promotes them out of Waiting - they are never in appDependencyList, so never in
-	// appsToSync - so one of them in Waiting would arm the gate permanently.
+	// RollingSync only ever promotes Waiting -> Pending, so with no step-selected Application in
+	// Waiting there is nothing to withhold and the gate stays out of the way. That is not an
+	// optimisation: it is what stops an ApplicationSet whose Applications legitimately never agree from
+	// being gated for its whole life. Applications no step selects are excluded for the same reason --
+	// nothing ever promotes them out of Waiting, so one of them would arm the gate permanently.
 	anyWaiting := false
 	var latestTransition time.Time
 	for _, appStatus := range appset.Status.ApplicationStatus {
