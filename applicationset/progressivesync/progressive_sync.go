@@ -67,17 +67,23 @@ type Manager struct {
 	// event that was never delivered. Required: with no uncached reader the cache cannot be verified,
 	// so past the threshold reverse deletion errors rather than trusting it. Production supplies
 	// mgr.GetAPIReader().
-	APIReader        client.Reader
-	dependencies     Dependencies
-	validationIssues *ValidationIssues // collected during progressive sync execution
+	APIReader client.Reader
+	// RevisionAwareGate makes the RollingSync gate refuse to release a wave while an Application in a
+	// later step has observed a revision the current step has not, instead of trusting a Healthy that
+	// may belong to the previous rollout. On by default; --progressive-sync-revision-aware-gate=false
+	// restores the previous behaviour without needing to roll back the controller.
+	RevisionAwareGate bool
+	dependencies      Dependencies
+	validationIssues  *ValidationIssues // collected during progressive sync execution
 }
 
 // NewManager creates a new manager with dependencies
 func NewManager(client client.Client, apiReader client.Reader, dependencies Dependencies) *Manager {
 	return &Manager{
-		Client:       client,
-		APIReader:    apiReader,
-		dependencies: dependencies,
+		Client:            client,
+		APIReader:         apiReader,
+		RevisionAwareGate: true,
+		dependencies:      dependencies,
 	}
 }
 
@@ -103,7 +109,9 @@ func (m *Manager) applicationGoneFromAPIServer(ctx context.Context, namespace, n
 	}
 }
 
-func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry, appset argov1alpha1.ApplicationSet, applications []argov1alpha1.Application, desiredApplications []argov1alpha1.Application) (map[string]bool, error) {
+// PerformProgressiveSyncs returns the Applications allowed to sync in this pass, plus a duration
+// after which the ApplicationSet should be reconciled again, or zero when no such requeue is needed.
+func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry, appset argov1alpha1.ApplicationSet, applications []argov1alpha1.Application, desiredApplications []argov1alpha1.Application) (map[string]bool, time.Duration, error) {
 	// Initialize validation tracking
 	m.validationIssues = &ValidationIssues{}
 
@@ -116,7 +124,7 @@ func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry
 
 	_, err := m.UpdateApplicationSetApplicationStatus(ctx, logCtx, &appset, applications, desiredApplications, appStepMap)
 	if err != nil {
-		return nil, fmt.Errorf("failed to update applicationset app status: %w", err)
+		return nil, 0, fmt.Errorf("failed to update applicationset app status: %w", err)
 	}
 
 	logCtx.Infof("ApplicationSet %v step list:", appset.Name)
@@ -125,11 +133,17 @@ func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry
 	}
 
 	appsToSync := getAppsToSync(appset, appDependencyList, applications)
+
+	requeueAfter := time.Duration(0)
+	if m.RevisionAwareGate {
+		appsToSync, requeueAfter = withholdRevisionSkewedSteps(logCtx, appset, appDependencyList, applications, appsToSync, time.Now())
+	}
+
 	logCtx.Infof("Application allowed to sync before maxUpdate?: %+v", appsToSync)
 
 	_, err = m.UpdateApplicationSetApplicationStatusProgress(ctx, logCtx, &appset, appsToSync, appStepMap)
 	if err != nil {
-		return nil, fmt.Errorf("failed to update applicationset application status progress: %w", err)
+		return nil, 0, fmt.Errorf("failed to update applicationset application status progress: %w", err)
 	}
 
 	progressingCondition := m.getProgressingCondition(&appset)
@@ -137,7 +151,7 @@ func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry
 	conditions := []*argov1alpha1.ApplicationSetCondition{invalidConfigCondition, progressingCondition}
 	_ = m.updateApplicationSetApplicationStatusConditions(ctx, &appset, conditions)
 
-	return appsToSync, nil
+	return appsToSync, requeueAfter, nil
 }
 
 func (m *Manager) PerformReverseDeletion(ctx context.Context, logCtx *log.Entry, appset argov1alpha1.ApplicationSet, currentApps []argov1alpha1.Application) (time.Duration, error) {
