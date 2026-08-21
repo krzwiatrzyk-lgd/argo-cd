@@ -340,3 +340,138 @@ func TestPerformProgressiveSyncsHoldsWhileApplicationsSettle(t *testing.T) {
 		})
 	}
 }
+
+// The flag is unbounded on the command line -- env.ParseDurationFromEnv bounds only the default it
+// computes -- and Manager.SettleWindow is exported, so the documented maximum has to be enforced
+// where the value is used rather than only where it is parsed.
+func TestNormalizeSettleWindow(t *testing.T) {
+	t.Parallel()
+
+	for _, cc := range []struct {
+		name     string
+		window   time.Duration
+		expected time.Duration
+	}{
+		{name: "zero stays disabled", window: 0, expected: 0},
+		{name: "a negative window is disabled, not inverted", window: -time.Second, expected: 0},
+		{name: "a very negative window is still just disabled", window: -100 * time.Hour, expected: 0},
+		{name: "a window inside the range is left alone", window: 30 * time.Second, expected: 30 * time.Second},
+		{name: "the maximum itself is left alone", window: MaxSettleWindow, expected: MaxSettleWindow},
+		{name: "a window past the maximum is clamped, not rejected", window: 10 * time.Minute, expected: MaxSettleWindow},
+	} {
+		t.Run(cc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, cc.expected, NormalizeSettleWindow(cc.window))
+		})
+	}
+}
+
+// remainingSettleWindow must apply the bound itself, so that a caller which sets SettleWindow
+// directly cannot hold a rollout for longer than the documented maximum.
+func TestRemainingSettleWindowEnforcesTheMaximum(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2025, time.June, 1, 12, 0, 0, 0, time.UTC)
+	waiting := metav1.Time{Time: now}
+	appSet := v1alpha1.ApplicationSet{
+		Status: v1alpha1.ApplicationSetStatus{
+			ApplicationStatus: []v1alpha1.ApplicationSetApplicationStatus{{
+				Application:        "app",
+				Status:             v1alpha1.ProgressiveSyncWaiting,
+				LastTransitionTime: &waiting,
+			}},
+		},
+	}
+
+	assert.Equal(t, MaxSettleWindow, remainingSettleWindow(&appSet, time.Hour, now),
+		"an over-long window must be clamped to the maximum, not honoured")
+	assert.Zero(t, remainingSettleWindow(&appSet, -time.Second, now),
+		"a negative window means disabled")
+}
+
+// A review of the settle-window PR raised this shape: an Application whose revisions changed but
+// which is already Synced and Healthy is set to Waiting in UpdateApplicationSetApplicationStatus and
+// then moved straight on to Healthy inside the same call. It leaves no Waiting entry, so
+// remainingSettleWindow finds no anchor and the window is zero -- the worry being that getAppsToSync
+// then releases later steps with no quiet period at all.
+//
+// It does release them, and that is harmless, which is what this test measures rather than argues.
+// Promotion to Pending requires the entry to be Waiting, and SyncDesiredApplications stamps an
+// operation only on an entry that is already Pending. A pass in which nothing is Waiting is a pass in
+// which nothing can be promoted or synced, whatever getAppsToSync returns. The next pass, once the
+// lagging Application does register the change and enters Waiting, is the one the window gates.
+func TestSettleWindowIsNotAnchoredBySamePassHealthyTransition(t *testing.T) {
+	t.Parallel()
+
+	appSet := v1alpha1.ApplicationSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "settle", Namespace: "argocd"},
+		Spec: v1alpha1.ApplicationSetSpec{
+			Strategy: &v1alpha1.ApplicationSetStrategy{
+				Type: "RollingSync",
+				RollingSync: &v1alpha1.ApplicationSetRolloutStrategy{
+					Steps: []v1alpha1.ApplicationSetRolloutStep{
+						{MatchExpressions: []v1alpha1.ApplicationMatchExpression{{Key: "step", Operator: "In", Values: []string{"1"}}}},
+						{MatchExpressions: []v1alpha1.ApplicationMatchExpression{{Key: "step", Operator: "In", Values: []string{"2"}}}},
+					},
+				},
+			},
+		},
+		Status: v1alpha1.ApplicationSetStatus{
+			ApplicationStatus: []v1alpha1.ApplicationSetApplicationStatus{
+				{
+					Application:        "step1-db",
+					Status:             v1alpha1.ProgressiveSyncHealthy,
+					Step:               "1",
+					TargetRevisions:    []string{"old"},
+					LastTransitionTime: &metav1.Time{Time: time.Now().Add(-time.Hour)},
+				},
+				{
+					Application:        "step2-web",
+					Status:             v1alpha1.ProgressiveSyncHealthy,
+					Step:               "2",
+					TargetRevisions:    []string{"old"},
+					LastTransitionTime: &metav1.Time{Time: time.Now().Add(-time.Hour)},
+				},
+			},
+		},
+	}
+
+	live := []v1alpha1.Application{
+		// Not refreshed for the new commit: still Synced and Healthy against the old one.
+		settleApp("step1-db", "1", "old", v1alpha1.SyncStatusCodeSynced),
+		// Refreshed, and already Synced and Healthy at the new commit. revisionsChanged fires, so
+		// this entry is set to Waiting and then immediately to Healthy in the same pass.
+		settleApp("step2-web", "2", "new", v1alpha1.SyncStatusCodeSynced),
+	}
+	desired := []v1alpha1.Application{*live[0].DeepCopy(), *live[1].DeepCopy()}
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1alpha1.AddToScheme(scheme))
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&appSet).WithStatusSubresource(&appSet).Build()
+
+	deps := &settleDeps{}
+	m := NewManager(c, c, deps)
+	m.SettleWindow = 30 * time.Second
+
+	appsToSync, requeue, err := m.PerformProgressiveSyncs(t.Context(), log.NewEntry(log.New()), appSet, live, desired)
+	require.NoError(t, err)
+
+	// The premise: no anchor, so no window, so no deferral, and getAppsToSync really does release
+	// both steps. Without this assertion an empty appsToSync would make the rest pass for the wrong
+	// reason.
+	assert.Zero(t, requeue, "with nothing in Waiting there is no quiet period to wait out")
+	assert.Equal(t, map[string]bool{"step1-db": true, "step2-web": true}, appsToSync,
+		"the review's premise: with no window open, every step is released")
+
+	// And the consequence the review was worried about does not follow.
+	require.Len(t, deps.lastStatuses, 2)
+	for _, status := range deps.lastStatuses {
+		assert.NotEqual(t, v1alpha1.ProgressiveSyncPending, status.Status,
+			"nothing was Waiting, so nothing can be promoted to Pending regardless of appsToSync (%v)", appsToSync)
+	}
+
+	promoted := v1alpha1.ApplicationSet{Status: v1alpha1.ApplicationSetStatus{ApplicationStatus: deps.lastStatuses}}
+	for _, app := range m.SyncDesiredApplications(log.NewEntry(log.New()), &promoted, appsToSync, desired) {
+		assert.Nil(t, app.Operation, "no operation may be stamped on %v: it is not Pending", app.Name)
+	}
+}

@@ -371,7 +371,9 @@ data:
   # Enables use of the Progressive Syncs capability
   applicationsetcontroller.enable.progressive.syncs: "false"
   # Quiet period to wait after a progressive sync first observes a change before promoting any Application to Pending.
-  # 0 disables the wait. Requires applicationsetcontroller.enable.progressive.syncs. Maximum 5m.
+  # 0 disables the wait. Requires applicationsetcontroller.enable.progressive.syncs.
+  # Maximum 5m: a larger value set here is not clamped, it is rejected with a warning and 0 is used
+  # instead, which turns the feature off. Only the command-line flag clamps.
   applicationsetcontroller.progressive.sync.settle.window: "0"
   # A list of glob patterns specifying where to look for ApplicationSet resources. (default is only the ns where the controller is installed)
   applicationsetcontroller.namespaces: "argocd,argocd-appsets-*"

@@ -116,8 +116,13 @@ rollout, including ones that were never at risk, is delayed by up to the configu
 normally enough. Under a burst of back-to-back commits the window keeps restarting, which is the intended debounce
 behavior but does mean the rollout waits for the burst to stop. This flag requires `--enable-progressive-syncs`.
 
-Values above `5m` set through the environment variable or the ConfigMap key are rejected with a warning and the
-default of `0` is used instead; the command-line flag is not bounded.
+The supported range is `0` to `5m`, and the bound is enforced wherever the value comes from, because the three
+configuration paths do not fail the same way. The environment variable and the ConfigMap key are parsed by
+`env.ParseDurationFromEnv`, which does not clamp: an out-of-range value is *rejected* with a warning and the default
+of `0` is used instead, so `10m` set that way turns the feature **off** rather than making it wait longer. The
+command-line flag is parsed without a bound, so it is normalized instead -- a negative value disables the window and
+anything above `5m` is clamped to `5m`, with the substitution logged at startup. Read that log line: in the ConfigMap
+case the effective value is `0`, and in the flag case it is `5m`.
 
 ### Deletion Strategies
 
