@@ -941,6 +941,18 @@ spec:
               key: applicationsetcontroller.enable.progressive.syncs
               name: argocd-cmd-params-cm
               optional: true
+        - name: ARGOCD_APPLICATIONSET_CONTROLLER_PROGRESSIVE_SYNC_REQUIRE_REVISION_CONSENSUS
+          valueFrom:
+            configMapKeyRef:
+              key: applicationsetcontroller.progressive.sync.require.revision.consensus
+              name: argocd-cmd-params-cm
+              optional: true
+        - name: ARGOCD_APPLICATIONSET_CONTROLLER_PROGRESSIVE_SYNC_REVISION_CONSENSUS_TIMEOUT
+          valueFrom:
+            configMapKeyRef:
+              key: applicationsetcontroller.progressive.sync.revision.consensus.timeout
+              name: argocd-cmd-params-cm
+              optional: true
         - name: ARGOCD_APPLICATIONSET_CONTROLLER_TOKENREF_STRICT_MODE
           valueFrom:
             configMapKeyRef:
