@@ -91,7 +91,7 @@ func gateAppSet(steps int, statuses ...argov1alpha1.ApplicationSetApplicationSta
 	}
 
 	return argov1alpha1.ApplicationSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "grafana", Namespace: "argocd"},
+		ObjectMeta: metav1.ObjectMeta{Name: "rolling", Namespace: "argocd"},
 		Spec: argov1alpha1.ApplicationSetSpec{
 			Strategy: &argov1alpha1.ApplicationSetStrategy{
 				Type:        "RollingSync",
@@ -124,8 +124,8 @@ func TestWithholdRevisionSkewedSteps(t *testing.T) {
 		return new(metav1.NewTime(now.Add(d)))
 	}
 
-	twoSteps := [][]string{{"grafana-beta2-sta"}, {"grafana-web1-sta"}}
-	bothSteps := map[string]bool{"grafana-beta2-sta": true, "grafana-web1-sta": true}
+	twoSteps := [][]string{{"app-beta"}, {"app-web"}}
+	bothSteps := map[string]bool{"app-beta": true, "app-web": true}
 
 	for _, cc := range []struct {
 		name              string
@@ -137,35 +137,35 @@ func TestWithholdRevisionSkewedSteps(t *testing.T) {
 		expectedRequeue   time.Duration
 	}{
 		{
-			// The regression. web1 refreshed first, observed the new config revision and is Waiting.
-			// beta2 has not been refreshed, so it still reports Synced against the previous commit
+			// The regression. app-web refreshed first, observed the new config revision and is Waiting.
+			// app-beta has not been refreshed, so it still reports Synced against the previous commit
 			// and its status is the Healthy it earned in the previous rollout. Step 2 must stay shut.
 			name: "next step already saw a revision the current step has not",
 			appSet: gateAppSet(2,
-				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-10*time.Minute)),
-				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-5*time.Second)),
+				gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-10*time.Minute)),
+				gateStatus("app-web", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-5*time.Second)),
 			),
 			appDependencyList: twoSteps,
 			currentApps: []argov1alpha1.Application{
-				gateApp("grafana-beta2-sta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
-				gateApp("grafana-web1-sta", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+				gateApp("app-beta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("app-web", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
 			},
 			appsToSync:      bothSteps,
-			expectedMap:     map[string]bool{"grafana-beta2-sta": true},
+			expectedMap:     map[string]bool{"app-beta": true},
 			expectedRequeue: revisionSkewRequeueInterval,
 		},
 		{
-			// Both Applications have observed the new commit, so beta2's Healthy belongs to the
-			// rollout in flight and web1 may proceed.
+			// Both Applications have observed the new commit, so app-beta's Healthy belongs to the
+			// rollout in flight and app-web may proceed.
 			name: "steps agree",
 			appSet: gateAppSet(2,
-				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateNewCfgRevision}, at(-30*time.Second)),
-				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-5*time.Second)),
+				gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateNewCfgRevision}, at(-30*time.Second)),
+				gateStatus("app-web", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-5*time.Second)),
 			),
 			appDependencyList: twoSteps,
 			currentApps: []argov1alpha1.Application{
-				gateApp("grafana-beta2-sta", "1", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
-				gateApp("grafana-web1-sta", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+				gateApp("app-beta", "1", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("app-web", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
 			},
 			appsToSync:  bothSteps,
 			expectedMap: bothSteps,
@@ -176,13 +176,13 @@ func TestWithholdRevisionSkewedSteps(t *testing.T) {
 			// gate's fail-open property: what it cannot prove, it does not block on.
 			name: "different git coordinates are not compared",
 			appSet: gateAppSet(2,
-				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateOldCfgRevision}, at(-10*time.Minute)),
-				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateNewCfgRevision}, at(-5*time.Second)),
+				gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateOldCfgRevision}, at(-10*time.Minute)),
+				gateStatus("app-web", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateNewCfgRevision}, at(-5*time.Second)),
 			),
 			appDependencyList: twoSteps,
 			currentApps: []argov1alpha1.Application{
-				gateSingleSourceApp("grafana-beta2-sta", "release-1.2", gateOldCfgRevision),
-				gateSingleSourceApp("grafana-web1-sta", "master", gateNewCfgRevision),
+				gateSingleSourceApp("app-beta", "release-1.2", gateOldCfgRevision),
+				gateSingleSourceApp("app-web", "master", gateNewCfgRevision),
 			},
 			appsToSync:  bothSteps,
 			expectedMap: bothSteps,
@@ -193,13 +193,13 @@ func TestWithholdRevisionSkewedSteps(t *testing.T) {
 			// the wave for the whole bound on every single rollout.
 			name: "different tag prefixes are not compared",
 			appSet: gateAppSet(2,
-				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateOldCfgRevision}, at(-10*time.Minute)),
-				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateNewCfgRevision}, at(-5*time.Second)),
+				gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateOldCfgRevision}, at(-10*time.Minute)),
+				gateStatus("app-web", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateNewCfgRevision}, at(-5*time.Second)),
 			),
 			appDependencyList: twoSteps,
 			currentApps: []argov1alpha1.Application{
-				gateHelmApp("grafana-beta2-sta", "beta2/", gateOldCfgRevision),
-				gateHelmApp("grafana-web1-sta", "web1/", gateNewCfgRevision),
+				gateHelmApp("app-beta", "beta/", gateOldCfgRevision),
+				gateHelmApp("app-web", "app-web/", gateNewCfgRevision),
 			},
 			appsToSync:  bothSteps,
 			expectedMap: bothSteps,
@@ -209,13 +209,13 @@ func TestWithholdRevisionSkewedSteps(t *testing.T) {
 			// has registered no change and holding it back would only add latency.
 			name: "later step is not waiting",
 			appSet: gateAppSet(2,
-				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-10*time.Minute)),
-				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateNewCfgRevision}, at(-5*time.Second)),
+				gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-10*time.Minute)),
+				gateStatus("app-web", "2", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateNewCfgRevision}, at(-5*time.Second)),
 			),
 			appDependencyList: twoSteps,
 			currentApps: []argov1alpha1.Application{
-				gateApp("grafana-beta2-sta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
-				gateApp("grafana-web1-sta", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("app-beta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("app-web", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
 			},
 			appsToSync:  bothSteps,
 			expectedMap: bothSteps,
@@ -225,13 +225,13 @@ func TestWithholdRevisionSkewedSteps(t *testing.T) {
 			// nothing for it to be behind.
 			name: "current step has never been compared",
 			appSet: gateAppSet(2,
-				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, nil, at(-10*time.Minute)),
-				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-5*time.Second)),
+				gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncHealthy, nil, at(-10*time.Minute)),
+				gateStatus("app-web", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-5*time.Second)),
 			),
 			appDependencyList: twoSteps,
 			currentApps: []argov1alpha1.Application{
-				gateApp("grafana-beta2-sta", "1", nil, argov1alpha1.SyncStatusCodeSynced),
-				gateApp("grafana-web1-sta", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+				gateApp("app-beta", "1", nil, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("app-web", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
 			},
 			appsToSync:  bothSteps,
 			expectedMap: bothSteps,
@@ -241,18 +241,18 @@ func TestWithholdRevisionSkewedSteps(t *testing.T) {
 			// just as wrong as releasing everything, so every step after the skewed one is withheld.
 			name: "skew against a step two ahead",
 			appSet: gateAppSet(3,
-				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-10*time.Minute)),
-				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-9*time.Minute)),
-				gateStatus("grafana-web2-sta", "3", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-5*time.Second)),
+				gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-10*time.Minute)),
+				gateStatus("app-web", "2", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-9*time.Minute)),
+				gateStatus("app-web2", "3", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-5*time.Second)),
 			),
-			appDependencyList: [][]string{{"grafana-beta2-sta"}, {"grafana-web1-sta"}, {"grafana-web2-sta"}},
+			appDependencyList: [][]string{{"app-beta"}, {"app-web"}, {"app-web2"}},
 			currentApps: []argov1alpha1.Application{
-				gateApp("grafana-beta2-sta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
-				gateApp("grafana-web1-sta", "2", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
-				gateApp("grafana-web2-sta", "3", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+				gateApp("app-beta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("app-web", "2", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("app-web2", "3", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
 			},
-			appsToSync:      map[string]bool{"grafana-beta2-sta": true, "grafana-web1-sta": true, "grafana-web2-sta": true},
-			expectedMap:     map[string]bool{"grafana-beta2-sta": true},
+			appsToSync:      map[string]bool{"app-beta": true, "app-web": true, "app-web2": true},
+			expectedMap:     map[string]bool{"app-beta": true},
 			expectedRequeue: revisionSkewRequeueInterval,
 		},
 		{
@@ -261,13 +261,13 @@ func TestWithholdRevisionSkewedSteps(t *testing.T) {
 			// the gate releases the wave rather than stall it for a reconciliation timeout.
 			name: "hold expired",
 			appSet: gateAppSet(2,
-				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-10*time.Minute)),
-				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-maxRevisionSkewHold-time.Second)),
+				gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-10*time.Minute)),
+				gateStatus("app-web", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-maxRevisionSkewHold-time.Second)),
 			),
 			appDependencyList: twoSteps,
 			currentApps: []argov1alpha1.Application{
-				gateApp("grafana-beta2-sta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
-				gateApp("grafana-web1-sta", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+				gateApp("app-beta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("app-web", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
 			},
 			appsToSync:  bothSteps,
 			expectedMap: bothSteps,
@@ -277,16 +277,16 @@ func TestWithholdRevisionSkewedSteps(t *testing.T) {
 			// woken every revisionSkewRequeueInterval, not once at the end of it.
 			name: "requeue is capped at revisionSkewRequeueInterval",
 			appSet: gateAppSet(2,
-				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-10*time.Minute)),
-				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(0)),
+				gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-10*time.Minute)),
+				gateStatus("app-web", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(0)),
 			),
 			appDependencyList: twoSteps,
 			currentApps: []argov1alpha1.Application{
-				gateApp("grafana-beta2-sta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
-				gateApp("grafana-web1-sta", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+				gateApp("app-beta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("app-web", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
 			},
 			appsToSync:      bothSteps,
-			expectedMap:     map[string]bool{"grafana-beta2-sta": true},
+			expectedMap:     map[string]bool{"app-beta": true},
 			expectedRequeue: revisionSkewRequeueInterval,
 		},
 		{
@@ -294,16 +294,16 @@ func TestWithholdRevisionSkewedSteps(t *testing.T) {
 			// decision is not deferred past the deadline by a full poll interval.
 			name: "requeue never outlasts the remaining hold",
 			appSet: gateAppSet(2,
-				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-10*time.Minute)),
-				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-maxRevisionSkewHold+4*time.Second)),
+				gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-10*time.Minute)),
+				gateStatus("app-web", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-maxRevisionSkewHold+4*time.Second)),
 			),
 			appDependencyList: twoSteps,
 			currentApps: []argov1alpha1.Application{
-				gateApp("grafana-beta2-sta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
-				gateApp("grafana-web1-sta", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+				gateApp("app-beta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("app-web", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
 			},
 			appsToSync:      bothSteps,
-			expectedMap:     map[string]bool{"grafana-beta2-sta": true},
+			expectedMap:     map[string]bool{"app-beta": true},
 			expectedRequeue: 4 * time.Second,
 		},
 		{
@@ -312,48 +312,48 @@ func TestWithholdRevisionSkewedSteps(t *testing.T) {
 			// wave nobody released.
 			name: "nothing to withhold because the wave was never released",
 			appSet: gateAppSet(2,
-				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncProgressing, []string{gateChartRevision, gateOldCfgRevision}, at(-10*time.Minute)),
-				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-5*time.Second)),
+				gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncProgressing, []string{gateChartRevision, gateOldCfgRevision}, at(-10*time.Minute)),
+				gateStatus("app-web", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-5*time.Second)),
 			),
 			appDependencyList: twoSteps,
 			currentApps: []argov1alpha1.Application{
-				gateApp("grafana-beta2-sta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
-				gateApp("grafana-web1-sta", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+				gateApp("app-beta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("app-web", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
 			},
-			appsToSync:  map[string]bool{"grafana-beta2-sta": true},
-			expectedMap: map[string]bool{"grafana-beta2-sta": true},
+			appsToSync:  map[string]bool{"app-beta": true},
+			expectedMap: map[string]bool{"app-beta": true},
 		},
 		{
 			name: "single step",
 			appSet: gateAppSet(1,
-				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-10*time.Minute)),
+				gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-10*time.Minute)),
 			),
-			appDependencyList: [][]string{{"grafana-beta2-sta"}},
+			appDependencyList: [][]string{{"app-beta"}},
 			currentApps: []argov1alpha1.Application{
-				gateApp("grafana-beta2-sta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("app-beta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
 			},
-			appsToSync:  map[string]bool{"grafana-beta2-sta": true},
-			expectedMap: map[string]bool{"grafana-beta2-sta": true},
+			appsToSync:  map[string]bool{"app-beta": true},
+			expectedMap: map[string]bool{"app-beta": true},
 		},
 		{
-			// The disagreement runs the other way: web1 is Waiting because its generated SPEC changed
-			// while it still reports the previous config commit, and beta2 has already moved to the
+			// The disagreement runs the other way: app-web is Waiting because its generated SPEC changed
+			// while it still reports the previous config commit, and app-beta has already moved to the
 			// new one. Nothing reachable from the ApplicationSet status orders two commits, so the
 			// gate cannot tell this apart from the regression above and holds here too. Pinned
 			// deliberately: it is a known, bounded latency cost, not an oversight. The next case is
 			// the bound paying out.
 			name: "a later step waiting on the older revision is held too, because the direction is not knowable",
 			appSet: gateAppSet(2,
-				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateNewCfgRevision}, at(-2*time.Minute)),
-				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateOldCfgRevision}, at(-5*time.Second)),
+				gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateNewCfgRevision}, at(-2*time.Minute)),
+				gateStatus("app-web", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateOldCfgRevision}, at(-5*time.Second)),
 			),
 			appDependencyList: twoSteps,
 			currentApps: []argov1alpha1.Application{
-				gateApp("grafana-beta2-sta", "1", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
-				gateApp("grafana-web1-sta", "2", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+				gateApp("app-beta", "1", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("app-web", "2", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
 			},
 			appsToSync:      bothSteps,
-			expectedMap:     map[string]bool{"grafana-beta2-sta": true},
+			expectedMap:     map[string]bool{"app-beta": true},
 			expectedRequeue: revisionSkewRequeueInterval,
 		},
 		{
@@ -362,13 +362,13 @@ func TestWithholdRevisionSkewedSteps(t *testing.T) {
 			// disagreement it cannot resolve. This is the failsafe that makes the case above a delay.
 			name: "the wave is released once the hold has elapsed",
 			appSet: gateAppSet(2,
-				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateNewCfgRevision}, at(-30*time.Minute)),
-				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateOldCfgRevision}, at(-maxRevisionSkewHold-time.Second)),
+				gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateNewCfgRevision}, at(-30*time.Minute)),
+				gateStatus("app-web", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateOldCfgRevision}, at(-maxRevisionSkewHold-time.Second)),
 			),
 			appDependencyList: twoSteps,
 			currentApps: []argov1alpha1.Application{
-				gateApp("grafana-beta2-sta", "1", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
-				gateApp("grafana-web1-sta", "2", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+				gateApp("app-beta", "1", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("app-web", "2", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
 			},
 			appsToSync:  bothSteps,
 			expectedMap: bothSteps,
@@ -380,18 +380,18 @@ func TestWithholdRevisionSkewedSteps(t *testing.T) {
 			// failsafe out; without that scoping this case would still be holding.
 			name: "another application entering waiting does not extend an elapsed hold",
 			appSet: gateAppSet(2,
-				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-30*time.Minute)),
-				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-maxRevisionSkewHold-time.Second)),
-				gateStatus("grafana-web2-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-time.Second)),
+				gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-30*time.Minute)),
+				gateStatus("app-web", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-maxRevisionSkewHold-time.Second)),
+				gateStatus("app-web2", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-time.Second)),
 			),
-			appDependencyList: [][]string{{"grafana-beta2-sta"}, {"grafana-web1-sta", "grafana-web2-sta"}},
+			appDependencyList: [][]string{{"app-beta"}, {"app-web", "app-web2"}},
 			currentApps: []argov1alpha1.Application{
-				gateApp("grafana-beta2-sta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
-				gateApp("grafana-web1-sta", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
-				gateApp("grafana-web2-sta", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+				gateApp("app-beta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("app-web", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+				gateApp("app-web2", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
 			},
-			appsToSync:  map[string]bool{"grafana-beta2-sta": true, "grafana-web1-sta": true, "grafana-web2-sta": true},
-			expectedMap: map[string]bool{"grafana-beta2-sta": true, "grafana-web1-sta": true, "grafana-web2-sta": true},
+			appsToSync:  map[string]bool{"app-beta": true, "app-web": true, "app-web2": true},
+			expectedMap: map[string]bool{"app-beta": true, "app-web": true, "app-web2": true},
 		},
 		{
 			name:              "empty dependency list",
@@ -421,10 +421,11 @@ func TestRemainingRevisionSkewHold(t *testing.T) {
 	}
 
 	for _, cc := range []struct {
-		name     string
-		laterApp string
-		statuses []argov1alpha1.ApplicationSetApplicationStatus
-		expected time.Duration
+		name            string
+		laterApp        string
+		statuses        []argov1alpha1.ApplicationSetApplicationStatus
+		expected        time.Duration
+		expectedBounded bool
 	}{
 		{
 			// The clock is the Waiting transition of the Application the skew was found against, not
@@ -437,7 +438,8 @@ func TestRemainingRevisionSkewHold(t *testing.T) {
 				gateStatus("a", "2", argov1alpha1.ProgressiveSyncWaiting, nil, at(-90*time.Second)),
 				gateStatus("b", "3", argov1alpha1.ProgressiveSyncWaiting, nil, at(-20*time.Second)),
 			},
-			expected: maxRevisionSkewHold - 90*time.Second,
+			expected:        maxRevisionSkewHold - 90*time.Second,
+			expectedBounded: true,
 		},
 		{
 			name:     "slice order does not matter",
@@ -446,7 +448,8 @@ func TestRemainingRevisionSkewHold(t *testing.T) {
 				gateStatus("b", "3", argov1alpha1.ProgressiveSyncWaiting, nil, at(-20*time.Second)),
 				gateStatus("a", "2", argov1alpha1.ProgressiveSyncWaiting, nil, at(-90*time.Second)),
 			},
-			expected: maxRevisionSkewHold - 90*time.Second,
+			expected:        maxRevisionSkewHold - 90*time.Second,
+			expectedBounded: true,
 		},
 		{
 			name:     "zero once the bound has elapsed",
@@ -454,7 +457,8 @@ func TestRemainingRevisionSkewHold(t *testing.T) {
 			statuses: []argov1alpha1.ApplicationSetApplicationStatus{
 				gateStatus("a", "2", argov1alpha1.ProgressiveSyncWaiting, nil, at(-maxRevisionSkewHold)),
 			},
-			expected: 0,
+			expected:        0,
+			expectedBounded: true,
 		},
 		{
 			// An elapsed hold stays elapsed however many other Applications are Waiting. This is the
@@ -466,7 +470,8 @@ func TestRemainingRevisionSkewHold(t *testing.T) {
 				gateStatus("b", "3", argov1alpha1.ProgressiveSyncWaiting, nil, at(0)),
 				gateStatus("c", "3", argov1alpha1.ProgressiveSyncWaiting, nil, at(0)),
 			},
-			expected: 0,
+			expected:        0,
+			expectedBounded: true,
 		},
 		{
 			// Without a timestamp the bound cannot be evaluated, and a hold whose bound cannot be
@@ -513,7 +518,10 @@ func TestRemainingRevisionSkewHold(t *testing.T) {
 			appSet := argov1alpha1.ApplicationSet{
 				Status: argov1alpha1.ApplicationSetStatus{ApplicationStatus: cc.statuses},
 			}
-			assert.Equal(t, cc.expected, remainingRevisionSkewHold(&appSet, cc.laterApp, now))
+			remaining, bounded := remainingRevisionSkewHold(&appSet, cc.laterApp, now)
+			assert.Equal(t, cc.expected, remaining)
+			assert.Equal(t, cc.expectedBounded, bounded,
+				"whether the bound could be evaluated at all decides which release reason the gate logs")
 		})
 	}
 }
@@ -554,20 +562,20 @@ func gateStatusOf(t *testing.T, statuses []argov1alpha1.ApplicationSetApplicatio
 func TestPerformProgressiveSyncsHoldsNextStepOnStaleHealthy(t *testing.T) {
 	t.Parallel()
 
-	// beta2 (step 1) has not been refreshed: it still reports Synced against the previous config
+	// app-beta (step 1) has not been refreshed: it still reports Synced against the previous config
 	// revision, so revisionsChanged is false for it and its status stays the Healthy it earned in
-	// the previous rollout. web1 (step 2) has been refreshed, has observed the new revision and is
+	// the previous rollout. app-web (step 2) has been refreshed, has observed the new revision and is
 	// OutOfSync, so it stays Waiting.
 	liveApps := []argov1alpha1.Application{
-		gateApp("grafana-beta2-sta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
-		gateApp("grafana-web1-sta", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+		gateApp("app-beta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+		gateApp("app-web", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
 	}
 	waitingSince := new(metav1.NewTime(time.Now().Add(-5 * time.Second)))
 
 	newAppSet := func() argov1alpha1.ApplicationSet {
 		return gateAppSet(2,
-			gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, new(metav1.NewTime(time.Now().Add(-10*time.Minute)))),
-			gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, waitingSince),
+			gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, new(metav1.NewTime(time.Now().Add(-10*time.Minute)))),
+			gateStatus("app-web", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, waitingSince),
 		)
 	}
 
@@ -583,10 +591,10 @@ func TestPerformProgressiveSyncsHoldsNextStepOnStaleHealthy(t *testing.T) {
 		appsToSync, requeue, err := m.PerformProgressiveSyncs(t.Context(), log.NewEntry(log.New()), appSet, liveApps, liveApps)
 		require.NoError(t, err)
 
-		assert.Equal(t, map[string]bool{"grafana-beta2-sta": true}, appsToSync,
+		assert.Equal(t, map[string]bool{"app-beta": true}, appsToSync,
 			"step 2 must not be released while step 1 is Healthy for a revision step 2 has moved past")
 		assert.Positive(t, requeue, "a withheld wave must ask to be reconsidered; nothing else guarantees a requeue")
-		assert.Equal(t, argov1alpha1.ProgressiveSyncWaiting, gateStatusOf(t, deps.statuses, "grafana-web1-sta").Status,
+		assert.Equal(t, argov1alpha1.ProgressiveSyncWaiting, gateStatusOf(t, deps.statuses, "app-web").Status,
 			"step 2 must not be promoted to Pending, which is what stamps a sync operation next reconcile")
 	})
 
@@ -602,10 +610,10 @@ func TestPerformProgressiveSyncsHoldsNextStepOnStaleHealthy(t *testing.T) {
 		appsToSync, requeue, err := m.PerformProgressiveSyncs(t.Context(), log.NewEntry(log.New()), appSet, liveApps, liveApps)
 		require.NoError(t, err)
 
-		assert.Equal(t, map[string]bool{"grafana-beta2-sta": true, "grafana-web1-sta": true}, appsToSync,
+		assert.Equal(t, map[string]bool{"app-beta": true, "app-web": true}, appsToSync,
 			"this is the bug: the gate reads step 1 as Healthy without asking which revision it is Healthy for")
 		assert.Zero(t, requeue)
-		assert.Equal(t, argov1alpha1.ProgressiveSyncPending, gateStatusOf(t, deps.statuses, "grafana-web1-sta").Status,
+		assert.Equal(t, argov1alpha1.ProgressiveSyncPending, gateStatusOf(t, deps.statuses, "app-web").Status,
 			"and step 2 is promoted to Pending, so the next reconcile stamps its sync operation")
 	})
 }
