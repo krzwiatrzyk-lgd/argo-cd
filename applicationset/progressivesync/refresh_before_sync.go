@@ -242,12 +242,17 @@ func (m *Manager) refreshApplicationsBehindRollout(ctx context.Context, logCtx *
 }
 
 // remainingRefreshHold reports how much of maxRefreshHold is left for a skew first observed at
-// anchor. A zero anchor means the ApplicationSet status carries no transition time to measure
-// against, in which case the hold starts fresh rather than reading as expired: a missing timestamp
-// must not release a wave the caller has just decided to hold.
+// anchor.
+//
+// A zero anchor means the ApplicationSet status carries no transition time to measure against, so
+// the bound cannot be evaluated -- and a hold whose bound cannot be evaluated is not bounded. The
+// caller re-evaluates on every requeue, so returning a full window here would restart the hold each
+// time and defer the decision forever. Report it as expired instead: the caller then decides on the
+// state available and logs a warning. Unreachable through the write path, where both transitions
+// into ProgressiveSyncWaiting stamp LastTransitionTime (progressive_sync.go:440 and :495-496).
 func remainingRefreshHold(anchor time.Time, now time.Time) time.Duration {
 	if anchor.IsZero() {
-		return maxRefreshHold
+		return 0
 	}
 	deadline := anchor.Add(maxRefreshHold)
 	if !now.Before(deadline) {

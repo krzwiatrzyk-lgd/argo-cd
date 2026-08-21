@@ -109,8 +109,9 @@ sync to a later reconciliation, once they have reported back. Applications that 
 revisions from different source coordinates, and Applications carrying an error that stops them
 reconciling at all, are not waited on.
 
-The wait is bounded at two minutes, measured from the `Waiting` transition that first recorded the
-change being waited on. An Application that never consumes its refresh — because the Application
+The wait is bounded at two minutes, measured from the earliest `Waiting` transition that recorded the
+change being waited on, so that Applications refreshing one after another cannot push the deadline out
+one refresh at a time. An Application that never consumes its refresh — because the Application
 controller is down, is not watching that namespace, or the Application belongs to a shard that is not
 running — carries no error condition and reports nothing new, so no exception can recognise it. Past
 the bound the decision is taken on the state available and a warning is logged, rather than the
