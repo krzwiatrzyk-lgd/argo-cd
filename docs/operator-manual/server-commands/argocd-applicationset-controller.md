@@ -48,6 +48,7 @@ argocd-applicationset-controller [flags]
       --preserved-annotations strings             Sets global preserved field values for annotations
       --preserved-labels strings                  Sets global preserved field values for labels
       --probe-addr string                         The address the probe endpoint binds to. (default ":8081")
+      --progressive-sync-refresh-all              When a progressive sync detects a change, refresh every Application in the ApplicationSet that has not observed it yet before deciding which Applications may sync. Reduces the chance of a RollingSync step being released against a revision an earlier step has not seen. Requires --enable-progressive-syncs.
       --proxy-url string                          If provided, this URL will be used to connect via proxy
       --repo-server-ca-cert-path string           Path to the repo-server CA certificate file
       --repo-server-client-cert-key-path string   Path to the client certificate key file for mTLS. Defaults to the auto-mounted Secret path; mTLS client cert is skipped if the file does not exist. (default "/app/config/reposerver/mtls/client.key")

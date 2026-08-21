@@ -1,0 +1,179 @@
+package progressivesync
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+	"strings"
+
+	log "github.com/sirupsen/logrus"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+
+	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// rolloutRevision pairs the revisions an Application has resolved with the source coordinates those
+// revisions belong to, so that the two are only ever compared between Applications that track the
+// same coordinates.
+type rolloutRevision struct {
+	sourceKeys []string
+	revisions  []string
+}
+
+// sourceKeySeparator joins the parts of a source key. A NUL byte cannot appear in any of them, so
+// distinct coordinates cannot collide into one key.
+const sourceKeySeparator = "\x00"
+
+// applicationSourceKeys identifies the coordinates an Application resolves its revisions from, in
+// spec source order. Two Applications sharing these coordinates must converge on the same resolved
+// revisions, so a difference between them means one has not been refreshed yet. Applications with
+// different coordinates legitimately sit at different revisions and are skipped.
+//
+// A field belongs in the key if and only if it changes which revision the source resolves to:
+//   - RepoURL and TargetRevision: the repository and the requested ref or version constraint.
+//   - Chart: for a Helm repository repoURL@targetRevision is not a source at all. The same repo at
+//     18.* with chart redis and with chart postgres are two different resolutions, and grouping them
+//     would demand a consensus that is impossible by construction.
+//   - TagPrefix: it filters which git tags a semver TargetRevision may resolve to and is re-added to
+//     the resolved version, so the same repo and constraint with different prefixes resolve to
+//     permanently different revisions.
+//
+// Path is deliberately absent: it changes what is rendered from a revision, not which revision is
+// resolved, and per-Application paths are the normal ApplicationSet shape, so including it would
+// stop the comparison seeing the Applications it exists to compare. So are Ref, Name and the
+// per-tool option blocks.
+func applicationSourceKeys(app *argov1alpha1.Application) []string {
+	sources := app.Spec.GetSources()
+	keys := make([]string, 0, len(sources))
+	for _, source := range sources {
+		keys = append(keys, strings.Join([]string{
+			source.RepoURL,
+			source.TargetRevision,
+			source.Chart,
+			source.TagPrefix,
+		}, sourceKeySeparator))
+	}
+	return keys
+}
+
+// refreshApplicationsBehindRollout asks the Application controller to re-compare every Application
+// in the ApplicationSet that has not observed the revision the rollout is about, and returns how
+// many Applications are behind it.
+//
+// The returned count is the number of Applications still behind, not the number of refreshes
+// issued: an Application whose refresh is already pending is counted but not patched again. The
+// annotation write itself requeues the ApplicationSet, usually well before the Application
+// controller has consumed it, so a count of refreshes issued would drop to zero on that requeue and
+// release the very step this exists to hold.
+//
+// The Application controller refreshes Applications independently, milliseconds apart. Until an
+// Application has been refreshed it still reports Synced and Healthy against the previous revision,
+// which is indistinguishable from having completed the current one: a RollingSync step reading that
+// state releases the next step against a revision it has never seen.
+//
+// Every skip below is deliberately fail-open. The hold this count drives has no deadline, so an
+// Application that can never converge must not be counted: it would stall the rollout rather than
+// delay it.
+func (m *Manager) refreshApplicationsBehindRollout(ctx context.Context, logCtx *log.Entry, applicationSet *argov1alpha1.ApplicationSet, applications []argov1alpha1.Application) (int, error) {
+	appMap := make(map[string]*argov1alpha1.Application, len(applications))
+	for i := range applications {
+		appMap[applications[i].Name] = &applications[i]
+	}
+
+	// Waiting is the only status that proves the ApplicationSet controller has observed a change for
+	// an Application, so the Applications in that state are what defines the revision of the rollout.
+	var frontier []rolloutRevision
+	for _, appStatus := range applicationSet.Status.ApplicationStatus {
+		if appStatus.Status != argov1alpha1.ProgressiveSyncWaiting {
+			continue
+		}
+		app, ok := appMap[appStatus.Application]
+		if !ok {
+			continue
+		}
+		revisions := app.Status.GetRevisions()
+		if len(revisions) == 0 {
+			continue
+		}
+		frontier = append(frontier, rolloutRevision{sourceKeys: applicationSourceKeys(app), revisions: revisions})
+	}
+
+	if len(frontier) == 0 {
+		// No Application has registered a change, so there is no revision for the others to be behind.
+		return 0, nil
+	}
+
+	appsBehind := 0
+	refreshRequests := 0
+	for _, appStatus := range applicationSet.Status.ApplicationStatus {
+		if appStatus.Status == argov1alpha1.ProgressiveSyncWaiting ||
+			appStatus.Status == argov1alpha1.ProgressiveSyncPending ||
+			appStatus.Status == argov1alpha1.ProgressiveSyncProgressing {
+			// The change is already registered for this Application, or it is already moving on it.
+			continue
+		}
+
+		app, ok := appMap[appStatus.Application]
+		if !ok {
+			continue
+		}
+
+		revisions := app.Status.GetRevisions()
+		if len(revisions) == 0 {
+			// The Application has never been compared, so there is nothing for it to be stale against.
+			continue
+		}
+
+		sourceKeys := applicationSourceKeys(app)
+		behind := false
+		for _, observed := range frontier {
+			if reflect.DeepEqual(sourceKeys, observed.sourceKeys) && !reflect.DeepEqual(revisions, observed.revisions) {
+				behind = true
+				break
+			}
+		}
+		if !behind {
+			continue
+		}
+
+		if isApplicationWithError(*app) {
+			// The Application cannot be reconciled, so its revisions will not advance however many
+			// refreshes it is sent, and counting it would hold the rollout for as long as it stays
+			// broken. This is the same predicate progressive sync already uses to stop waiting on a
+			// broken Application, see UpdateApplicationSetApplicationStatus.
+			logCtx.WithField("app.name", app.Name).Info("Not waiting for an application that is behind the rollout but has an error and cannot reconcile")
+			continue
+		}
+
+		appsBehind++
+
+		if _, alreadyRequested := app.Annotations[argov1alpha1.AnnotationKeyRefresh]; alreadyRequested {
+			// A refresh is already pending, patching the same annotation again would only churn the
+			// object. The Application still counts as behind: it has not reported back yet.
+			continue
+		}
+
+		patch := client.RawPatch(types.MergePatchType, []byte(`{"metadata":{"annotations":{"`+argov1alpha1.AnnotationKeyRefresh+`":"`+string(argov1alpha1.RefreshTypeNormal)+`"}}}`))
+		if err := m.Client.Patch(ctx, app, patch); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return appsBehind, fmt.Errorf("failed to request refresh of application %s: %w", app.Name, err)
+		}
+
+		refreshRequests++
+		logCtx.WithField("app.name", app.Name).Info("Requesting a refresh, the Application has not observed the revision the rollout is about")
+	}
+
+	if appsBehind > 0 {
+		logCtx.WithFields(log.Fields{
+			"applications.behind":    appsBehind,
+			"applications.refreshed": refreshRequests,
+		}).Info("Applications have not observed the revision the rollout is about")
+	}
+
+	return appsBehind, nil
+}

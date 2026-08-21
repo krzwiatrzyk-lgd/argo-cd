@@ -67,9 +67,13 @@ type Manager struct {
 	// event that was never delivered. Required: with no uncached reader the cache cannot be verified,
 	// so past the threshold reverse deletion errors rather than trusting it. Production supplies
 	// mgr.GetAPIReader().
-	APIReader        client.Reader
-	dependencies     Dependencies
-	validationIssues *ValidationIssues // collected during progressive sync execution
+	APIReader client.Reader
+	// RefreshApplicationsBeforeSync makes the manager request a refresh of Applications that have not
+	// yet observed the revision the rollout is about, and hold the sync decision until they report
+	// back. Off by default; enabled with --progressive-sync-refresh-all.
+	RefreshApplicationsBeforeSync bool
+	dependencies                  Dependencies
+	validationIssues              *ValidationIssues // collected during progressive sync execution
 }
 
 // NewManager creates a new manager with dependencies
@@ -125,6 +129,25 @@ func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry
 	}
 
 	appsToSync := getAppsToSync(appset, appDependencyList, applications)
+
+	if m.RefreshApplicationsBeforeSync {
+		appsBehind, err := m.refreshApplicationsBehindRollout(ctx, logCtx, &appset, applications)
+		if err != nil {
+			return nil, fmt.Errorf("failed to refresh applications behind the rollout: %w", err)
+		}
+		if appsBehind > 0 {
+			// Some Application is known to be reporting against an older revision than the rollout, so
+			// the state this pass would decide on is mixed: promote nothing and let the decision be
+			// made once every Application has reported against the same revision. This holds for as
+			// long as any Application is behind, whether or not its refresh was requested on this
+			// pass. No explicit requeue is needed: the refresh annotation mutates the Application, and
+			// shouldRequeueForApplication requeues the ApplicationSet on an annotation difference
+			// through its Owns(&Application{}) watch.
+			appsToSync = map[string]bool{}
+			logCtx.Infof("Deferring the sync decision, %v application(s) have not observed the current revision", appsBehind)
+		}
+	}
+
 	logCtx.Infof("Application allowed to sync before maxUpdate?: %+v", appsToSync)
 
 	_, err = m.UpdateApplicationSetApplicationStatusProgress(ctx, logCtx, &appset, appsToSync, appStepMap)

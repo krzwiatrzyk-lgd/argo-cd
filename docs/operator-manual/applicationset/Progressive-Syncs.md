@@ -96,6 +96,24 @@ Once each batch of Applications reaches a `Healthy` status, the next batch is sy
 
 If there are any applications that don't match the listed expressions, they will not be synced by the RollingSync strategy and must be manually synced as describe above.
 
+##### Refreshing Applications before releasing the next step
+
+The Application controller refreshes Applications independently, so for a short window after a new
+commit lands an Application it has not reached yet still reports `Synced` and `Healthy` against the
+previous revision. A RollingSync step reading that state can be released against a revision the
+previous step has never seen.
+
+When enabled, the controller requests a refresh of every Application in the ApplicationSet that has
+not observed the revision the rollout is about, and postpones the decision of which Applications may
+sync to a later reconciliation, once they have reported back. Applications that resolve their
+revisions from different source coordinates, and Applications carrying an error that stops them
+reconciling at all, are not waited on. It is disabled by default, requires progressive syncs to be
+enabled, and is turned on in one of these ways.
+
+1. Pass `--progressive-sync-refresh-all` to the ApplicationSet controller args.
+1. Set `ARGOCD_APPLICATIONSET_CONTROLLER_PROGRESSIVE_SYNC_REFRESH_ALL=true` in the ApplicationSet controller environment variables.
+1. Set `applicationsetcontroller.progressive.sync.refresh.all: "true"` in the Argo CD `argocd-cmd-params-cm` ConfigMap.
+
 ### Deletion Strategies
 
 The `deletionOrder` field controls the order in which applications are deleted when they are removed from the ApplicationSet. Available values:
