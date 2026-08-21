@@ -96,6 +96,47 @@ Once each batch of Applications reaches a `Healthy` status, the next batch is sy
 
 If there are any applications that don't match the listed expressions, they will not be synced by the RollingSync strategy and must be manually synced as describe above.
 
+##### Refreshing Applications before releasing the next step
+
+The Application controller refreshes Applications independently, so for a short window after a new
+commit lands an Application it has not reached yet still reports `Synced` and `Healthy` against the
+previous revision. A RollingSync step reading that state can be released against a revision the
+previous step has never seen.
+
+When enabled, the controller requests a refresh of every Application in the ApplicationSet that has
+not observed the revision the rollout is about, and postpones the decision of which Applications may
+sync to a later reconciliation, once they have reported back. Applications that resolve their
+revisions from different source coordinates, and Applications carrying an error that stops them
+reconciling at all, are not waited on.
+
+The wait is bounded at two minutes, and there are two levels to the bound because there can be more
+than one Application behind at once.
+
+*Per Application*, the deadline runs from the **oldest** observation that Application disagrees with —
+the earliest `Waiting` transition recording the change being waited on — so Applications refreshing one
+after another cannot push the deadline out one refresh at a time. If no such transition carries a
+timestamp at all the bound cannot be evaluated, and that Application is treated as **already past** it
+rather than as starting a fresh window; a wait whose end cannot be computed is not a bounded wait.
+
+*Across Applications*, the controller keeps waiting while **any** of them is still inside its own
+window, so one Application that has run out of time does not release a wave another is still
+legitimately waiting on.
+
+An Application that never consumes its refresh — because the Application controller is down, is not
+watching that namespace, or the Application belongs to a shard that is not running — carries no error
+condition and reports nothing new, so the controller cannot tell it apart from a refresh that is merely
+late. Once every outstanding wait has passed the bound, the decision is taken on the state available
+and a warning is logged, rather than the rollout being held for as long as that lasts. While the decision is deferred the ApplicationSet is
+re-examined every ten seconds; that poll is also what makes the wait recover on its own, because a
+pass that finds an Application already annotated patches nothing and so raises no event of its own.
+
+It is disabled by default, requires progressive syncs to be enabled, and is turned on in one of these
+ways.
+
+1. Pass `--progressive-sync-refresh-all` to the ApplicationSet controller args.
+1. Set `ARGOCD_APPLICATIONSET_CONTROLLER_PROGRESSIVE_SYNC_REFRESH_ALL=true` in the ApplicationSet controller environment variables.
+1. Set `applicationsetcontroller.progressive.sync.refresh.all: "true"` in the Argo CD `argocd-cmd-params-cm` ConfigMap.
+
 ### Deletion Strategies
 
 The `deletionOrder` field controls the order in which applications are deleted when they are removed from the ApplicationSet. Available values:

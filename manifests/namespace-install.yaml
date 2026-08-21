@@ -909,6 +909,12 @@ spec:
               key: applicationsetcontroller.enable.progressive.syncs
               name: argocd-cmd-params-cm
               optional: true
+        - name: ARGOCD_APPLICATIONSET_CONTROLLER_PROGRESSIVE_SYNC_REFRESH_ALL
+          valueFrom:
+            configMapKeyRef:
+              key: applicationsetcontroller.progressive.sync.refresh.all
+              name: argocd-cmd-params-cm
+              optional: true
         - name: ARGOCD_APPLICATIONSET_CONTROLLER_TOKENREF_STRICT_MODE
           valueFrom:
             configMapKeyRef:
