@@ -65,6 +65,7 @@ func NewCommand() *cobra.Command {
 		debugLog                     bool
 		dryRun                       bool
 		enableProgressiveSyncs       bool
+		progressiveSyncSettleWindow  time.Duration
 		enableNewGitFileGlobbing     bool
 		repoServerPlaintext          bool
 		repoServerStrictTLS          bool
@@ -275,6 +276,18 @@ func NewCommand() *cobra.Command {
 				ConcurrentApplicationUpdates: concurrentApplicationUpdates,
 			}
 			appsetReconciler.ProgressiveSyncManager = progressivesync.NewManager(cacheSyncClient, mgr.GetAPIReader(), appsetReconciler)
+			// The flag itself is unbounded: env.ParseDurationFromEnv only bounds the default it
+			// computes, so a value passed on the command line arrives here unchecked. Normalize it
+			// where a human can be told about it, rather than letting the controller run a window
+			// nobody asked for.
+			settleWindow := progressivesync.NormalizeSettleWindow(progressiveSyncSettleWindow)
+			if settleWindow != progressiveSyncSettleWindow {
+				log.Info("progressive sync settle window is outside the supported range, using the nearest supported value",
+					"configured", progressiveSyncSettleWindow.String(),
+					"using", settleWindow.String(),
+					"max", progressivesync.MaxSettleWindow.String())
+			}
+			appsetReconciler.ProgressiveSyncManager.SettleWindow = settleWindow
 
 			if err = appsetReconciler.SetupWithManager(mgr, enableProgressiveSyncs, maxConcurrentReconciliations); err != nil {
 				log.Error(err, "unable to create controller", "controller", "ApplicationSet")
@@ -309,6 +322,7 @@ func NewCommand() *cobra.Command {
 	command.Flags().BoolVar(&dryRun, "dry-run", env.ParseBoolFromEnv("ARGOCD_APPLICATIONSET_CONTROLLER_DRY_RUN", false), "Enable dry run mode")
 	command.Flags().BoolVar(&tokenRefStrictMode, "token-ref-strict-mode", env.ParseBoolFromEnv("ARGOCD_APPLICATIONSET_CONTROLLER_TOKENREF_STRICT_MODE", false), fmt.Sprintf("Set to true to require secrets referenced by SCM providers to have the %s=%s label set (Default: false)", common.LabelKeySecretType, common.LabelValueSecretTypeSCMCreds))
 	command.Flags().BoolVar(&enableProgressiveSyncs, "enable-progressive-syncs", env.ParseBoolFromEnv("ARGOCD_APPLICATIONSET_CONTROLLER_ENABLE_PROGRESSIVE_SYNCS", false), "Enable use of the experimental progressive syncs feature.")
+	command.Flags().DurationVar(&progressiveSyncSettleWindow, "progressive-sync-settle-window", env.ParseDurationFromEnv("ARGOCD_APPLICATIONSET_CONTROLLER_PROGRESSIVE_SYNC_SETTLE_WINDOW", 0, 0, progressivesync.MaxSettleWindow), "Quiet period to wait after a progressive sync first observes a change before promoting any Application to Pending. Gives Applications that have not refreshed yet time to register the same change, so a RollingSync step is not released against a revision an earlier step has not seen. 0 disables the wait, and values above 5m are clamped to 5m. Requires --enable-progressive-syncs.")
 	command.Flags().BoolVar(&enableNewGitFileGlobbing, "enable-new-git-file-globbing", env.ParseBoolFromEnv("ARGOCD_APPLICATIONSET_CONTROLLER_ENABLE_NEW_GIT_FILE_GLOBBING", false), "Enable new globbing in Git files generator.")
 	command.Flags().BoolVar(&repoServerPlaintext, "repo-server-plaintext", env.ParseBoolFromEnv("ARGOCD_APPLICATIONSET_CONTROLLER_REPO_SERVER_PLAINTEXT", false), "Disable TLS on connections to repo server")
 	command.Flags().BoolVar(&repoServerStrictTLS, "repo-server-strict-tls", env.ParseBoolFromEnv("ARGOCD_APPLICATIONSET_CONTROLLER_REPO_SERVER_STRICT_TLS", false), "Whether to use strict validation of the TLS cert presented by the repo server")

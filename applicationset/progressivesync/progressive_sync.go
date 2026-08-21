@@ -67,7 +67,11 @@ type Manager struct {
 	// event that was never delivered. Required: with no uncached reader the cache cannot be verified,
 	// so past the threshold reverse deletion errors rather than trusting it. Production supplies
 	// mgr.GetAPIReader().
-	APIReader        client.Reader
+	APIReader client.Reader
+	// SettleWindow is how long the manager waits after an Application first registers a change before
+	// it promotes anything, giving Applications that have not refreshed yet time to register the same
+	// change. Zero disables the wait; enabled with --progressive-sync-settle-window.
+	SettleWindow     time.Duration
 	dependencies     Dependencies
 	validationIssues *ValidationIssues // collected during progressive sync execution
 }
@@ -103,7 +107,9 @@ func (m *Manager) applicationGoneFromAPIServer(ctx context.Context, namespace, n
 	}
 }
 
-func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry, appset argov1alpha1.ApplicationSet, applications []argov1alpha1.Application, desiredApplications []argov1alpha1.Application) (map[string]bool, error) {
+// PerformProgressiveSyncs returns the Applications allowed to sync in this pass, plus a duration
+// after which the ApplicationSet should be reconciled again, or zero when no such requeue is needed.
+func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry, appset argov1alpha1.ApplicationSet, applications []argov1alpha1.Application, desiredApplications []argov1alpha1.Application) (map[string]bool, time.Duration, error) {
 	// Initialize validation tracking
 	m.validationIssues = &ValidationIssues{}
 
@@ -116,7 +122,7 @@ func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry
 
 	_, err := m.UpdateApplicationSetApplicationStatus(ctx, logCtx, &appset, applications, desiredApplications, appStepMap)
 	if err != nil {
-		return nil, fmt.Errorf("failed to update applicationset app status: %w", err)
+		return nil, 0, fmt.Errorf("failed to update applicationset app status: %w", err)
 	}
 
 	logCtx.Infof("ApplicationSet %v step list:", appset.Name)
@@ -124,12 +130,26 @@ func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry
 		logCtx.Infof("step %v: %+v", stepIndex+1, applicationNames)
 	}
 
-	appsToSync := getAppsToSync(appset, appDependencyList, applications)
+	// Statuses are current at this point, so the settle window is evaluated against what this pass
+	// just observed rather than against the previous reconciliation.
+	appsToSync := map[string]bool{}
+	settleRemaining := remainingSettleWindow(&appset, m.SettleWindow, time.Now())
+	if settleRemaining > 0 {
+		// Promote nothing while the window is open. An Application that has not refreshed yet still
+		// reports the previous revision as Healthy, and releasing a step on that reading starts the
+		// next step against a revision the earlier one has not seen.
+		logCtx.WithFields(log.Fields{
+			"settleWindow":    m.SettleWindow,
+			"settleRemaining": settleRemaining,
+		}).Info("Holding progressive sync rollout decision while Applications settle")
+	} else {
+		appsToSync = getAppsToSync(appset, appDependencyList, applications)
+	}
 	logCtx.Infof("Application allowed to sync before maxUpdate?: %+v", appsToSync)
 
 	_, err = m.UpdateApplicationSetApplicationStatusProgress(ctx, logCtx, &appset, appsToSync, appStepMap)
 	if err != nil {
-		return nil, fmt.Errorf("failed to update applicationset application status progress: %w", err)
+		return nil, 0, fmt.Errorf("failed to update applicationset application status progress: %w", err)
 	}
 
 	progressingCondition := m.getProgressingCondition(&appset)
@@ -137,7 +157,9 @@ func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry
 	conditions := []*argov1alpha1.ApplicationSetCondition{invalidConfigCondition, progressingCondition}
 	_ = m.updateApplicationSetApplicationStatusConditions(ctx, &appset, conditions)
 
-	return appsToSync, nil
+	// The caller has to requeue on this: expiry of the quiet period is not an event any watch will
+	// report, so without the hint nothing would wake the controller to make the deferred decision.
+	return appsToSync, settleRemaining, nil
 }
 
 func (m *Manager) PerformReverseDeletion(ctx context.Context, logCtx *log.Entry, appset argov1alpha1.ApplicationSet, currentApps []argov1alpha1.Application) (time.Duration, error) {

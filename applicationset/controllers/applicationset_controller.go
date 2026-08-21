@@ -248,6 +248,9 @@ func (r *ApplicationSetReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// appSyncMap tracks which apps will be synced during this reconciliation.
 	appSyncMap := map[string]bool{}
+	// progressiveSyncRequeue is how long progressive sync wants to be reconciled again in, or zero
+	// when it has nothing pending that a watch would not already report.
+	progressiveSyncRequeue := time.Duration(0)
 
 	if r.EnableProgressiveSyncs {
 		if !progressivesync.IsRollingSyncStrategy(&applicationSetInfo) && len(applicationSetInfo.Status.ApplicationStatus) > 0 {
@@ -274,7 +277,7 @@ func (r *ApplicationSetReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				)
 				return ctrl.Result{RequeueAfter: ReconcileRequeueOnValidationError}, nil
 			}
-			appSyncMap, err = r.ProgressiveSyncManager.PerformProgressiveSyncs(ctx, logCtx, applicationSetInfo, currentApplications, generatedApplications)
+			appSyncMap, progressiveSyncRequeue, err = r.ProgressiveSyncManager.PerformProgressiveSyncs(ctx, logCtx, applicationSetInfo, currentApplications, generatedApplications)
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to perform progressive sync reconciliation for application set: %w", err)
 			}
@@ -441,6 +444,12 @@ func (r *ApplicationSetReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	} else if requeueAfter == time.Duration(0) {
 		// Ensure that the request is requeued if there are validation errors.
 		requeueAfter = ReconcileRequeueOnValidationError
+	}
+
+	// Folded in last so it only ever brings the requeue forward: the validation error fallback above
+	// still decides whether a requeue happens at all, and every other schedule keeps its meaning.
+	if progressiveSyncRequeue > 0 && (requeueAfter == time.Duration(0) || progressiveSyncRequeue < requeueAfter) {
+		requeueAfter = progressiveSyncRequeue
 	}
 
 	logCtx.WithField("requeueAfter", requeueAfter).Info("end reconcile in ", time.Since(startReconcile))

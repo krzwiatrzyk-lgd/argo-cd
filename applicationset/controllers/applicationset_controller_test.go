@@ -5473,3 +5473,154 @@ func startAndSyncInformer(t *testing.T, informer cache.SharedIndexInformer) cont
 	}
 	return cancel
 }
+
+// The settle window is the only thing progressive sync defers on a timer, and no watch reports the
+// expiry of a quiet period. So the duration PerformProgressiveSyncs returns has to reach
+// ctrl.Result, or the deferred decision is never taken on an ApplicationSet whose generators ask for
+// no periodic requeue (a List generator here, a cluster generator in production).
+func TestReconcileFoldsSettleWindowIntoRequeueAfter(t *testing.T) {
+	for _, cc := range []struct {
+		name           string
+		settleWindow   time.Duration
+		expectedStatus map[string]v1alpha1.ProgressiveSyncStatusCode
+	}{
+		{
+			name:         "window disabled leaves the requeue schedule alone",
+			settleWindow: 0,
+			// Upstream behaviour: step 1 is promoted, step 2 waits for it to become Healthy.
+			expectedStatus: map[string]v1alpha1.ProgressiveSyncStatusCode{
+				"db":  v1alpha1.ProgressiveSyncPending,
+				"web": v1alpha1.ProgressiveSyncWaiting,
+			},
+		},
+		{
+			name:         "open window brings the requeue forward",
+			settleWindow: 30 * time.Second,
+			// Nothing is promoted while the window is open, not even the first step.
+			expectedStatus: map[string]v1alpha1.ProgressiveSyncStatusCode{
+				"db":  v1alpha1.ProgressiveSyncWaiting,
+				"web": v1alpha1.ProgressiveSyncWaiting,
+			},
+		},
+	} {
+		t.Run(cc.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			err := v1alpha1.AddToScheme(scheme)
+			require.NoError(t, err)
+			err = corev1.AddToScheme(scheme)
+			require.NoError(t, err)
+
+			defaultProject := v1alpha1.AppProject{
+				ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "argocd"},
+				Spec: v1alpha1.AppProjectSpec{
+					SourceRepos:  []string{"*"},
+					Destinations: []v1alpha1.ApplicationDestination{{Namespace: "*", Server: "https://good-cluster"}},
+				},
+			}
+			appSet := v1alpha1.ApplicationSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "name", Namespace: "argocd"},
+				Spec: v1alpha1.ApplicationSetSpec{
+					Generators: []v1alpha1.ApplicationSetGenerator{
+						{
+							List: &v1alpha1.ListGenerator{
+								Elements: []apiextensionsv1.JSON{
+									{Raw: []byte(`{"cluster": "db","url": "https://good-cluster","step": "1"}`)},
+									{Raw: []byte(`{"cluster": "web","url": "https://good-cluster","step": "2"}`)},
+								},
+							},
+						},
+					},
+					Strategy: &v1alpha1.ApplicationSetStrategy{
+						Type: "RollingSync",
+						RollingSync: &v1alpha1.ApplicationSetRolloutStrategy{
+							Steps: []v1alpha1.ApplicationSetRolloutStep{
+								{MatchExpressions: []v1alpha1.ApplicationMatchExpression{{Key: "step", Operator: "In", Values: []string{"1"}}}},
+								{MatchExpressions: []v1alpha1.ApplicationMatchExpression{{Key: "step", Operator: "In", Values: []string{"2"}}}},
+							},
+						},
+					},
+					Template: v1alpha1.ApplicationSetTemplate{
+						ApplicationSetTemplateMeta: v1alpha1.ApplicationSetTemplateMeta{
+							Name:      "{{cluster}}",
+							Namespace: "argocd",
+							Labels:    map[string]string{"step": "{{step}}"},
+						},
+						Spec: v1alpha1.ApplicationSpec{
+							Source:      &v1alpha1.ApplicationSource{RepoURL: "https://github.com/argoproj/argocd-example-apps", Path: "guestbook"},
+							Project:     "default",
+							Destination: v1alpha1.ApplicationDestination{Server: "{{url}}"},
+						},
+					},
+				},
+			}
+
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "good-cluster",
+					Namespace: "argocd",
+					Labels:    map[string]string{argocommon.LabelKeySecretType: argocommon.LabelValueSecretTypeCluster},
+				},
+				Data: map[string][]byte{
+					"name":   []byte("good-cluster"),
+					"server": []byte("https://good-cluster"),
+					"config": []byte("{\"username\":\"foo\",\"password\":\"foo\"}"),
+				},
+			}
+
+			kubeclientset := getDefaultTestClientSet(secret)
+			client := fake.NewClientBuilder().WithScheme(scheme).
+				WithObjects(&appSet, &defaultProject, secret).
+				WithStatusSubresource(&appSet).
+				WithIndex(&v1alpha1.Application{}, ".metadata.controller", appControllerIndexer).
+				Build()
+			metrics := appsetmetrics.NewFakeAppsetMetrics()
+			argodb := db.NewDB("argocd", settings.NewSettingsManager(t.Context(), kubeclientset, "argocd"), kubeclientset)
+			clusterInformer, err := settings.NewClusterInformer(kubeclientset, "argocd")
+			require.NoError(t, err)
+			defer startAndSyncInformer(t, clusterInformer)()
+
+			r := ApplicationSetReconciler{
+				Client:                 client,
+				Scheme:                 scheme,
+				Renderer:               &utils.Render{},
+				Recorder:               record.NewFakeRecorder(10),
+				Generators:             map[string]generators.Generator{"List": generators.NewListGenerator()},
+				ArgoDB:                 argodb,
+				ArgoCDNamespace:        "argocd",
+				KubeClientset:          kubeclientset,
+				Policy:                 v1alpha1.ApplicationsSyncPolicySync,
+				Metrics:                metrics,
+				ClusterInformer:        clusterInformer,
+				EnableProgressiveSyncs: true,
+			}
+			r.ProgressiveSyncManager = progressivesync.NewManager(r.Client, r.Client, &r)
+			r.ProgressiveSyncManager.SettleWindow = cc.settleWindow
+
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "argocd", Name: "name"}}
+
+			// First pass creates the Applications; they only become visible as current Applications,
+			// and therefore only acquire a progressive sync status, on the pass after that.
+			_, err = r.Reconcile(t.Context(), req)
+			require.NoError(t, err)
+
+			res, err := r.Reconcile(t.Context(), req)
+			require.NoError(t, err)
+
+			var updatedAppSet v1alpha1.ApplicationSet
+			require.NoError(t, r.Get(t.Context(), req.NamespacedName, &updatedAppSet))
+			require.Len(t, updatedAppSet.Status.ApplicationStatus, 2)
+			for _, status := range updatedAppSet.Status.ApplicationStatus {
+				require.Equal(t, cc.expectedStatus[status.Application], status.Status,
+					"progressive sync status of %v did not match", status.Application)
+			}
+
+			if cc.settleWindow == 0 {
+				// The List generator asks for no periodic requeue, so nothing else can move this.
+				assert.Equal(t, time.Duration(0), res.RequeueAfter)
+				return
+			}
+			assert.Positive(t, res.RequeueAfter, "with the window open the controller must schedule its own wake-up")
+			assert.LessOrEqual(t, res.RequeueAfter, cc.settleWindow, "the requeue can never exceed the configured window")
+		})
+	}
+}

@@ -96,6 +96,34 @@ Once each batch of Applications reaches a `Healthy` status, the next batch is sy
 
 If there are any applications that don't match the listed expressions, they will not be synced by the RollingSync strategy and must be manually synced as describe above.
 
+##### Settle Window
+
+The Application controller refreshes Applications independently, so when a new commit lands the ApplicationSet
+controller does not learn about it for every Application at the same instant. An Application it has not refreshed
+yet still reports the previous revision as `Synced` and `Healthy`, which can be read as "this step is done" and
+release the next step against a revision the earlier step has not applied.
+
+The settle window makes the controller wait for a quiet period after any Application registers a change before it
+promotes anything, so the decision is taken once the remaining Applications have had a chance to register the same
+change. It is configured in one of these ways.
+
+1. Pass `--progressive-sync-settle-window=5s` to the ApplicationSet controller args.
+1. Set `ARGOCD_APPLICATIONSET_CONTROLLER_PROGRESSIVE_SYNC_SETTLE_WINDOW=5s` in the ApplicationSet controller environment variables.
+1. Set `applicationsetcontroller.progressive.sync.settle.window: "5s"` in the Argo CD `argocd-cmd-params-cm` ConfigMap.
+
+The default is `0`, which disables the wait and keeps the existing behavior. The trade-off is latency: every
+rollout, including ones that were never at risk, is delayed by up to the configured window. A few seconds is
+normally enough. Under a burst of back-to-back commits the window keeps restarting, which is the intended debounce
+behavior but does mean the rollout waits for the burst to stop. This flag requires `--enable-progressive-syncs`.
+
+The supported range is `0` to `5m`, and the bound is enforced wherever the value comes from, because the three
+configuration paths do not fail the same way. The environment variable and the ConfigMap key are parsed by
+`env.ParseDurationFromEnv`, which does not clamp: an out-of-range value is *rejected* with a warning and the default
+of `0` is used instead, so `10m` set that way turns the feature **off** rather than making it wait longer. The
+command-line flag is parsed without a bound, so it is normalized instead -- a negative value disables the window and
+anything above `5m` is clamped to `5m`, with the substitution logged at startup. Read that log line: in the ConfigMap
+case the effective value is `0`, and in the flag case it is `5m`.
+
 ### Deletion Strategies
 
 The `deletionOrder` field controls the order in which applications are deleted when they are removed from the ApplicationSet. Available values:
