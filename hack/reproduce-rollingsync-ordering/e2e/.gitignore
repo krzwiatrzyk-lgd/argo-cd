@@ -1,0 +1,8 @@
+# Everything this harness produces at run time. Nothing here is source.
+bin/
+cmp/
+gitroot/
+logs/
+run/
+runs/
+state/

@@ -1,14 +1,22 @@
 # Reproducing the RollingSync out-of-order rollout
 
 A progressive-sync (`strategy.type: RollingSync`) ApplicationSet can start step 2 before step 1 has
-rolled out at all. This directory reproduces that against a live cluster.
+rolled out at all. There are three reproductions here, in increasing cost. Pick by what you want to
+be convinced of.
 
-If you only want to see the bug, and not run a cluster, there is a deterministic Go reproduction that
-needs nothing but the repository:
+| # | Reproduction | Needs | Races? | What it establishes |
+|---|---|---|---|---|
+| 1 | `go test -run TestRollingSyncReleasesLaterStepOnStaleHealthy ./applicationset/controllers/` | nothing but this repository | no | the gate releases step 2 off a `Healthy` that belongs to the *previous* revision, and stamps a revisionless sync operation on it |
+| 2 | [`e2e/`](e2e/) — k3d cluster, Argo CD components built from source | Docker, k3d, kubectl, Go, python3 | no — the refresh skew is injected, not waited for | the same decision, made by the real controllers against a real API server, observed as the `ConfigMap` that actually lands in the cluster |
+| 3 | [`reproduce.sh`](reproduce.sh) — your own cluster, your own git remote | an Argo CD install, a repository you can push to | yes | the bug as an operator meets it, on an install you already trust |
 
-```sh
-go test -count=1 -v -run TestRollingSyncReleasesLaterStepOnStaleHealthy ./applicationset/controllers/
-```
+Start with 1: it is one `go test` away and it asserts the *symptom* rather than a helper's return
+value. Run 2 when you want to disbelieve 1 — it removes the fake client and the hand-written status
+from the loop entirely, and [`e2e/EVIDENCE.md`](e2e/EVIDENCE.md) records a full baseline-vs-fix cycle
+against a live cluster. Run 3 only if you want the production *timing*, which is also the reason it is
+the only one of the three that can fail to reproduce on any given attempt.
+
+The rest of this file documents reproduction 3.
 
 ## The mechanism
 
