@@ -336,6 +336,64 @@ func TestWithholdRevisionSkewedSteps(t *testing.T) {
 			expectedMap: map[string]bool{"grafana-beta2-sta": true},
 		},
 		{
+			// The disagreement runs the other way: web1 is Waiting because its generated SPEC changed
+			// while it still reports the previous config commit, and beta2 has already moved to the
+			// new one. Nothing reachable from the ApplicationSet status orders two commits, so the
+			// gate cannot tell this apart from the regression above and holds here too. Pinned
+			// deliberately: it is a known, bounded latency cost, not an oversight. The next case is
+			// the bound paying out.
+			name: "a later step waiting on the older revision is held too, because the direction is not knowable",
+			appSet: gateAppSet(2,
+				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateNewCfgRevision}, at(-2*time.Minute)),
+				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateOldCfgRevision}, at(-5*time.Second)),
+			),
+			appDependencyList: twoSteps,
+			currentApps: []argov1alpha1.Application{
+				gateApp("grafana-beta2-sta", "1", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("grafana-web1-sta", "2", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+			},
+			appsToSync:      bothSteps,
+			expectedMap:     map[string]bool{"grafana-beta2-sta": true},
+			expectedRequeue: revisionSkewRequeueInterval,
+		},
+		{
+			// Same fixture, but the later step has been Waiting for longer than maxRevisionSkewHold.
+			// The gate gives up and releases the wave rather than stalling the rollout on a
+			// disagreement it cannot resolve. This is the failsafe that makes the case above a delay.
+			name: "the wave is released once the hold has elapsed",
+			appSet: gateAppSet(2,
+				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateNewCfgRevision}, at(-30*time.Minute)),
+				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateOldCfgRevision}, at(-maxRevisionSkewHold-time.Second)),
+			),
+			appDependencyList: twoSteps,
+			currentApps: []argov1alpha1.Application{
+				gateApp("grafana-beta2-sta", "1", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("grafana-web1-sta", "2", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+			},
+			appsToSync:  bothSteps,
+			expectedMap: bothSteps,
+		},
+		{
+			// The regression fixture again, with a second step-2 Application that enters Waiting
+			// later than the one driving the hold. The bound is measured from the Application the
+			// skew was found against, so an unrelated refresh landing mid-hold cannot push the
+			// failsafe out; without that scoping this case would still be holding.
+			name: "another application entering waiting does not extend an elapsed hold",
+			appSet: gateAppSet(2,
+				gateStatus("grafana-beta2-sta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-30*time.Minute)),
+				gateStatus("grafana-web1-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-maxRevisionSkewHold-time.Second)),
+				gateStatus("grafana-web2-sta", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-time.Second)),
+			),
+			appDependencyList: [][]string{{"grafana-beta2-sta"}, {"grafana-web1-sta", "grafana-web2-sta"}},
+			currentApps: []argov1alpha1.Application{
+				gateApp("grafana-beta2-sta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
+				gateApp("grafana-web1-sta", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+				gateApp("grafana-web2-sta", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
+			},
+			appsToSync:  map[string]bool{"grafana-beta2-sta": true, "grafana-web1-sta": true, "grafana-web2-sta": true},
+			expectedMap: map[string]bool{"grafana-beta2-sta": true, "grafana-web1-sta": true, "grafana-web2-sta": true},
+		},
+		{
 			name:              "empty dependency list",
 			appSet:            gateAppSet(0),
 			appDependencyList: [][]string{},
@@ -364,55 +422,85 @@ func TestRemainingRevisionSkewHold(t *testing.T) {
 
 	for _, cc := range []struct {
 		name     string
+		laterApp string
 		statuses []argov1alpha1.ApplicationSetApplicationStatus
 		expected time.Duration
 	}{
 		{
-			name: "newest waiting transition wins",
+			// The clock is the Waiting transition of the Application the skew was found against, not
+			// the newest one in the ApplicationSet. "b" is newer here and must be ignored: in a
+			// many-step ApplicationSet, Applications keep entering Waiting as their own refreshes
+			// land, and taking the newest would push the release failsafe out every time one did.
+			name:     "measured from the named application, not the newest waiting transition",
+			laterApp: "a",
 			statuses: []argov1alpha1.ApplicationSetApplicationStatus{
-				gateStatus("a", "1", argov1alpha1.ProgressiveSyncWaiting, nil, at(-90*time.Second)),
-				gateStatus("b", "2", argov1alpha1.ProgressiveSyncWaiting, nil, at(-20*time.Second)),
+				gateStatus("a", "2", argov1alpha1.ProgressiveSyncWaiting, nil, at(-90*time.Second)),
+				gateStatus("b", "3", argov1alpha1.ProgressiveSyncWaiting, nil, at(-20*time.Second)),
 			},
-			expected: maxRevisionSkewHold - 20*time.Second,
+			expected: maxRevisionSkewHold - 90*time.Second,
 		},
 		{
-			name: "newest waiting transition wins regardless of slice order",
+			name:     "slice order does not matter",
+			laterApp: "a",
 			statuses: []argov1alpha1.ApplicationSetApplicationStatus{
-				gateStatus("b", "2", argov1alpha1.ProgressiveSyncWaiting, nil, at(-20*time.Second)),
-				gateStatus("a", "1", argov1alpha1.ProgressiveSyncWaiting, nil, at(-90*time.Second)),
+				gateStatus("b", "3", argov1alpha1.ProgressiveSyncWaiting, nil, at(-20*time.Second)),
+				gateStatus("a", "2", argov1alpha1.ProgressiveSyncWaiting, nil, at(-90*time.Second)),
 			},
-			expected: maxRevisionSkewHold - 20*time.Second,
+			expected: maxRevisionSkewHold - 90*time.Second,
 		},
 		{
-			name: "a nil transition time does not shadow a valid one",
+			name:     "zero once the bound has elapsed",
+			laterApp: "a",
 			statuses: []argov1alpha1.ApplicationSetApplicationStatus{
-				gateStatus("a", "1", argov1alpha1.ProgressiveSyncWaiting, nil, nil),
-				gateStatus("b", "2", argov1alpha1.ProgressiveSyncWaiting, nil, at(-30*time.Second)),
-			},
-			expected: maxRevisionSkewHold - 30*time.Second,
-		},
-		{
-			name: "transitions of other statuses are ignored",
-			statuses: []argov1alpha1.ApplicationSetApplicationStatus{
-				gateStatus("a", "1", argov1alpha1.ProgressiveSyncWaiting, nil, at(-100*time.Second)),
-				gateStatus("b", "2", argov1alpha1.ProgressiveSyncHealthy, nil, at(0)),
-				gateStatus("c", "2", argov1alpha1.ProgressiveSyncPending, nil, at(0)),
-			},
-			expected: maxRevisionSkewHold - 100*time.Second,
-		},
-		{
-			name: "zero once the bound has elapsed",
-			statuses: []argov1alpha1.ApplicationSetApplicationStatus{
-				gateStatus("a", "1", argov1alpha1.ProgressiveSyncWaiting, nil, at(-maxRevisionSkewHold)),
+				gateStatus("a", "2", argov1alpha1.ProgressiveSyncWaiting, nil, at(-maxRevisionSkewHold)),
 			},
 			expected: 0,
 		},
 		{
-			// Nothing to measure against, so the hold starts now rather than being treated as expired.
-			name: "no waiting transition time at all",
+			// An elapsed hold stays elapsed however many other Applications are Waiting. This is the
+			// unit-level form of the guarantee: the bound is a bound.
+			name:     "an elapsed hold is not extended by other applications",
+			laterApp: "a",
 			statuses: []argov1alpha1.ApplicationSetApplicationStatus{
-				gateStatus("a", "1", argov1alpha1.ProgressiveSyncWaiting, nil, nil),
+				gateStatus("a", "2", argov1alpha1.ProgressiveSyncWaiting, nil, at(-maxRevisionSkewHold-time.Hour)),
+				gateStatus("b", "3", argov1alpha1.ProgressiveSyncWaiting, nil, at(0)),
+				gateStatus("c", "3", argov1alpha1.ProgressiveSyncWaiting, nil, at(0)),
 			},
+			expected: 0,
+		},
+		{
+			// A missing timestamp must not release a wave the gate has just decided to withhold, so
+			// the hold restarts rather than reading as expired.
+			name:     "a nil transition time starts the hold fresh",
+			laterApp: "a",
+			statuses: []argov1alpha1.ApplicationSetApplicationStatus{
+				gateStatus("a", "2", argov1alpha1.ProgressiveSyncWaiting, nil, nil),
+				gateStatus("b", "3", argov1alpha1.ProgressiveSyncWaiting, nil, at(-30*time.Second)),
+			},
+			expected: maxRevisionSkewHold,
+		},
+		{
+			name:     "no status entry for the named application starts the hold fresh",
+			laterApp: "missing",
+			statuses: []argov1alpha1.ApplicationSetApplicationStatus{
+				gateStatus("a", "2", argov1alpha1.ProgressiveSyncWaiting, nil, at(-90*time.Second)),
+			},
+			expected: maxRevisionSkewHold,
+		},
+		{
+			// findStepRevisionSkew only ever names a Waiting Application, so this is defensive: a
+			// status that has moved on since is not a clock this hold may use.
+			name:     "the named application not in waiting starts the hold fresh",
+			laterApp: "a",
+			statuses: []argov1alpha1.ApplicationSetApplicationStatus{
+				gateStatus("a", "2", argov1alpha1.ProgressiveSyncHealthy, nil, at(-90*time.Second)),
+			},
+			expected: maxRevisionSkewHold,
+		},
+		{
+			name:     "no statuses at all starts the hold fresh",
+			laterApp: "a",
+			statuses: nil,
 			expected: maxRevisionSkewHold,
 		},
 	} {
@@ -422,7 +510,7 @@ func TestRemainingRevisionSkewHold(t *testing.T) {
 			appSet := argov1alpha1.ApplicationSet{
 				Status: argov1alpha1.ApplicationSetStatus{ApplicationStatus: cc.statuses},
 			}
-			assert.Equal(t, cc.expected, remainingRevisionSkewHold(&appSet, now))
+			assert.Equal(t, cc.expected, remainingRevisionSkewHold(&appSet, cc.laterApp, now))
 		})
 	}
 }

@@ -115,10 +115,19 @@ hold would only add latency:
 - Applications resolving different Git coordinates (`repoURL`, `targetRevision`, `chart`, `tagPrefix`).
   They are allowed to sit at different revisions indefinitely.
 - A later step whose Applications are not in `Waiting`. Nothing has been observed there that could be
-  raced.
+  raced. This is the common case of an Application that has simply not been refreshed yet.
 
-The hold is bounded at two minutes, measured from the most recent `Waiting` transition recorded in the
-ApplicationSet status. That bound matters when a commit does not touch an earlier step's
+The comparison establishes that two Applications disagree about the revisions they have observed, not
+which of them is newer: an ApplicationSet status carries no commit ancestry, and the ApplicationSet
+controller resolves no revisions of its own. So one uncommon shape is also held: a later step in
+`Waiting` because its *generated spec* changed, while it still reports the previous commit and the
+earlier step has already moved to the new one. The bound below is what keeps that a delay rather than
+a problem.
+
+The hold is bounded at two minutes, measured from the `Waiting` transition of the later-step
+Application the skew was found against — not from the most recent `Waiting` transition anywhere in the
+ApplicationSet, so that other Applications entering `Waiting` as their own refreshes land cannot push
+the bound out. That bound matters when a commit does not touch an earlier step's
 [`manifest-generate-paths`](../high_availability.md#manifest-paths-annotation): the earlier
 step's Application is then never refreshed for that commit, and from the ApplicationSet controller this
 is indistinguishable from a refresh that is merely late. Past the bound the step is released and a
