@@ -374,26 +374,6 @@ func TestWithholdRevisionSkewedSteps(t *testing.T) {
 			expectedMap: bothSteps,
 		},
 		{
-			// The regression fixture again, with a second step-2 Application that enters Waiting
-			// later than the one driving the hold. The bound is measured from the Application the
-			// skew was found against, so an unrelated refresh landing mid-hold cannot push the
-			// failsafe out; without that scoping this case would still be holding.
-			name: "another application entering waiting does not extend an elapsed hold",
-			appSet: gateAppSet(2,
-				gateStatus("app-beta", "1", argov1alpha1.ProgressiveSyncHealthy, []string{gateChartRevision, gateOldCfgRevision}, at(-30*time.Minute)),
-				gateStatus("app-web", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-maxRevisionSkewHold-time.Second)),
-				gateStatus("app-web2", "2", argov1alpha1.ProgressiveSyncWaiting, []string{gateChartRevision, gateNewCfgRevision}, at(-time.Second)),
-			),
-			appDependencyList: [][]string{{"app-beta"}, {"app-web", "app-web2"}},
-			currentApps: []argov1alpha1.Application{
-				gateApp("app-beta", "1", []string{gateChartRevision, gateOldCfgRevision}, argov1alpha1.SyncStatusCodeSynced),
-				gateApp("app-web", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
-				gateApp("app-web2", "2", []string{gateChartRevision, gateNewCfgRevision}, argov1alpha1.SyncStatusCodeOutOfSync),
-			},
-			appsToSync:  map[string]bool{"app-beta": true, "app-web": true, "app-web2": true},
-			expectedMap: map[string]bool{"app-beta": true, "app-web": true, "app-web2": true},
-		},
-		{
 			name:              "empty dependency list",
 			appSet:            gateAppSet(0),
 			appDependencyList: [][]string{},

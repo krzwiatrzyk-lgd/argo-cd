@@ -126,16 +126,25 @@ controller resolves no revisions of its own. So one uncommon shape is also held:
 earlier step has already moved to the new one. The bound below is what keeps that a delay rather than
 a problem.
 
-The hold is bounded at two minutes, measured from the affected later-step Application's `Waiting`
-transition — not from the most recent `Waiting` transition anywhere in the ApplicationSet, so that
-other Applications entering `Waiting` as their own refreshes land cannot push the bound out. That
-bound matters when a commit does not touch an earlier step's
+The hold is bounded at two minutes, measured from the **earliest** `Waiting` transition among the
+later-step Applications whose observed revisions differ from the step being waited on. Neither a
+sibling Application entering `Waiting` as its own refresh lands mid-hold nor the order in which the
+Applications happen to be listed can move that deadline.
+
+That bound matters when a commit does not touch an earlier step's
 [`manifest-generate-paths`](../high_availability.md#manifest-paths-annotation): the earlier
 step's Application is then never refreshed for that commit, and from the ApplicationSet controller this
 is indistinguishable from a refresh that is merely late. Past the bound the step is released and a
 warning is logged, rather than the rollout stalling for as long as the Application controller's
 `timeout.reconciliation`. While a step is withheld the ApplicationSet is re-examined every ten seconds,
 because a revision-only change to an Application produces no watch event.
+
+The bound is per disagreement, not per rollout. A **new** commit reaching those later-step
+Applications changes their observed revisions, which stamps a new `Waiting` transition and starts a new
+two-minute window against the disagreement that commit created. A stream of commits landing on a later
+step faster than the bound, while an earlier step is never refreshed for any of them, can therefore
+keep that later step withheld for as long as the stream lasts. Every individual hold still expires and
+logs its release.
 
 This gating is enabled by default. It can be turned off, in one of these ways, which restores the
 previous behavior of gating purely on `Healthy`:

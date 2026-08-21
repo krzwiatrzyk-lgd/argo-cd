@@ -6,52 +6,37 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/argoproj/argo-cd/v3/applicationset/utils"
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 )
 
 const (
-	// maxRevisionSkewHold bounds how long the revision-aware gate withholds a wave.
-	//
-	// A commit that does not touch an earlier step's manifest-generate-paths never refreshes that
-	// step's Application, so its resolved revision stays behind until the Application controller's
-	// own reconciliation timeout fires. From the ApplicationSet controller that is indistinguishable
-	// from a refresh that is merely late, so the gate cannot wait indefinitely: past this bound it
-	// releases the wave and says so, rather than stalling the rollout for as long as that timeout.
-	//
-	// The bound carries a second job. The gate can prove that two Applications disagree about the
-	// revisions they have observed, but not which of them is newer: an ApplicationSet status holds no
-	// commit ancestry, and the ApplicationSet controller resolves no revisions of its own. So a
-	// disagreement in the other direction -- a later step Waiting on its generated spec while still
-	// reporting the previous commit, with the current step already on the new one -- is held too. The
-	// bound is what keeps that a bounded latency cost instead of a correctness problem.
+	// maxRevisionSkewHold bounds how long a wave is withheld. A commit that does not touch an earlier
+	// step's manifest-generate-paths never refreshes that step's Application, and from here that is
+	// indistinguishable from a refresh that is merely late, so the gate must not wait forever. The
+	// bound also covers the reverse disagreement, which this gate cannot tell apart from the one it
+	// exists for; see the Revision-aware step gating section of Progressive-Syncs.md.
 	maxRevisionSkewHold = 2 * time.Minute
 
-	// revisionSkewRequeueInterval is how often the ApplicationSet is re-examined while a wave is
-	// withheld. A poll is needed because the event that clears the hold is not guaranteed to exist:
-	// shouldRequeueForApplication ignores Status.Sync.Revision, so an Application that refreshes and
-	// turns out to be Synced at the new revision anyway produces no watch event, and an
-	// ApplicationSet generated only by the cluster generator has no periodic requeue either
-	// (ClusterGenerator.GetRequeueAfter returns NoRequeueAfter).
+	// revisionSkewRequeueInterval polls while a wave is withheld, because the event that would clear
+	// the hold is not guaranteed to exist: shouldRequeueForApplication ignores Status.Sync.Revision,
+	// and a cluster-generated ApplicationSet has no periodic requeue (ClusterGenerator.GetRequeueAfter
+	// returns NoRequeueAfter).
 	revisionSkewRequeueInterval = 10 * time.Second
 )
 
 // applicationSourceKeys identifies the Git coordinates an Application resolves its revisions from,
 // in spec source order. Two Applications sharing these coordinates must converge on the same
-// resolved revisions, so a difference between them means one of the two has not been refreshed yet.
-// Applications with different coordinates legitimately sit at different revisions, and comparing
-// them would hold the rollout forever, so they are skipped.
+// revisions; Applications with different coordinates legitimately differ forever, so callers skip
+// those pairs rather than demand a consensus that cannot arrive.
 //
-// The key is exactly the fields that decide which commit a source resolves to: RepoURL,
-// TargetRevision, Chart (for a Helm repo, repoURL and version alone are not a source: redis at 18.*
-// and postgres at 18.* are different resolutions) and TagPrefix (it filters which git tags a semver
-// TargetRevision may resolve to, so the same repo and the same 1.0.* constraint under two prefixes
-// resolve to permanently different revisions). Path, Ref, Name and the per-tool blocks are
-// deliberately excluded: they change what is rendered from a commit, not which commit is resolved,
-// and per-cluster paths are the normal ApplicationSet shape. Neither RepoURL nor TargetRevision is
-// normalized: within one ApplicationSet every Application comes from one template, so any difference
-// is a deliberate per-Application difference and is the signal worth keeping.
+// The key holds only the fields that decide which commit a source resolves to. Chart and TagPrefix
+// are in because they change the resolution (repoURL plus version is not a Helm source, and TagPrefix
+// filters which tags a semver constraint may match). Path, Ref, Name and the per-tool blocks are out
+// because they change what is rendered from a commit, not which commit is picked -- and per-cluster
+// paths are the normal ApplicationSet shape.
 func applicationSourceKeys(app *argov1alpha1.Application) []string {
 	sources := app.Spec.GetSources()
 	keys := make([]string, 0, len(sources))
@@ -63,22 +48,15 @@ func applicationSourceKeys(app *argov1alpha1.Application) []string {
 	return keys
 }
 
-// withholdRevisionSkewedSteps removes from appsToSync every Application in a step later than the
-// first step that is demonstrably evaluating an older revision than a later step has already
-// observed, and returns how long to wait before deciding again. It returns appsToSync unchanged and
-// a zero duration when no such skew exists, or when the hold has already lasted longer than
-// maxRevisionSkewHold.
+// withholdRevisionSkewedSteps removes from appsToSync every Application whose only step is later than
+// the first step that disagrees with a later step about the revisions they have observed, and returns
+// how long to wait before deciding again. appsToSync and a zero duration mean nothing is withheld:
+// either no step disagrees, or every disagreement has outlasted maxRevisionSkewHold.
 //
-// getAppsToSync gates a step purely on ProgressiveSyncHealthy, and Healthy does not say which
-// revision it is healthy for. An Application the Application controller has not refreshed yet still
-// reports Synced against the previous commit, so revisionsChanged is false for it in this pass and
-// its status stays the Healthy earned in the previous rollout. It does reach Waiting, but only once a
-// later reconcile sees the refreshed Application -- by which point the next wave has already been
-// released and its sync operation stamped. That is how RollingSync ends up syncing two steps at once.
-//
-// Filtering the returned map is equivalent to breaking out of getAppsToSync's own loop earlier:
-// getAppsToSync adds steps 0..k for the first incomplete step k, so dropping every step after the
-// skewed one leaves exactly the steps that loop would have added had it stopped there.
+// getAppsToSync gates a step on ProgressiveSyncHealthy alone, and Healthy does not say which revision
+// it belongs to. Filtering its result is equivalent to stopping its loop earlier: it adds steps 0..k
+// for the first incomplete step k, so dropping every step after the skewed one leaves exactly what
+// that loop would have produced had it stopped there.
 func withholdRevisionSkewedSteps(
 	logCtx *log.Entry,
 	applicationSet argov1alpha1.ApplicationSet,
@@ -97,20 +75,12 @@ func withholdRevisionSkewedSteps(
 	}
 
 	for stepIndex := range len(appDependencyList) - 1 {
-		stepApp, laterApp := findStepRevisionSkew(applicationSet, appDependencyList, appMap, stepIndex)
+		stepApp, laterApp := findStepRevisionSkew(&applicationSet, appDependencyList, appMap, stepIndex)
 		if stepApp == "" {
 			continue
 		}
 
-		withheld := make(map[string]bool, len(appsToSync))
-		for appName := range appsToSync {
-			withheld[appName] = true
-		}
-		for laterStep := stepIndex + 1; laterStep < len(appDependencyList); laterStep++ {
-			for _, appName := range appDependencyList[laterStep] {
-				delete(withheld, appName)
-			}
-		}
+		withheld := withholdStepsAfter(appDependencyList, appsToSync, stepIndex)
 		if len(withheld) == len(appsToSync) {
 			// getAppsToSync already stopped at or before this step, so every later step is absent
 			// from the map and there is nothing left to withhold. Reporting a hold here would be a
@@ -128,124 +98,167 @@ func withholdRevisionSkewedSteps(
 			"app.later.revisions": strings.Join(appMap[laterApp].Status.GetRevisions(), ","),
 		})
 
-		remaining := remainingRevisionSkewHold(&applicationSet, laterApp, now)
-		if remaining <= 0 {
+		remaining, bounded := remainingRevisionSkewHold(&applicationSet, laterApp, now)
+		switch {
+		case !bounded:
+			// No timestamp to measure the bound against, so this hold cannot be shown to end. Release
+			// it: a hold whose bound cannot be evaluated is not bounded, and re-deriving a fresh
+			// window on every requeue would withhold the step forever.
+			gateLogCtx.Warn("Releasing the next progressive sync wave with a revision skew still present: the ApplicationSet status carries no Waiting transition time to bound the hold with")
+		case remaining <= 0:
 			// The Application that is behind may not be late at all: a commit that does not touch its
 			// manifest-generate-paths never refreshes it, and that is indistinguishable from here.
 			// Release the wave rather than stall the rollout, but make the decision visible.
 			gateLogCtx.WithField("maxHold", maxRevisionSkewHold).
 				Warn("Releasing the next progressive sync wave with a revision skew still present: the two steps did not converge on the same revisions within the hold window")
-			return appsToSync, 0
+		default:
+			gateLogCtx.Info("Holding the next progressive sync wave: an Application in a later step has observed different revisions than this step, so this step's Healthy may belong to the previous rollout")
+			return withheld, min(remaining, revisionSkewRequeueInterval)
 		}
 
-		gateLogCtx.Info("Holding the next progressive sync wave: an Application in a later step has observed different revisions than this step, so this step's Healthy may belong to the previous rollout")
-
-		requeue := min(remaining, revisionSkewRequeueInterval)
-		return withheld, requeue
+		// This step's skew is released, but a later pair may still have a hold left to run: keep
+		// looking rather than releasing the whole rollout on the strength of one elapsed bound.
 	}
 
 	return appsToSync, 0
 }
 
-// findStepRevisionSkew reports an Application pair showing that the step at stepIndex and a LATER
-// step disagree about the revisions they have observed: the Application in this step and the one in
-// the later step, or two empty strings when the steps agree.
+// withholdStepsAfter copies appsToSync without the Applications whose only membership is in a step
+// after stepIndex.
 //
-// It establishes that the two disagree, not which of them is newer -- nothing reachable from here
-// orders two commits. In the case this gate exists for the step is the stale side, because its
-// Healthy was earned before the change reached it; maxRevisionSkewHold documents the other direction
-// and why it is bounded rather than prevented.
+// "Only" is load-bearing: matchExpressions may select one Application into two steps, and
+// buildAppDependencyList records that under ValidationIssues.DuplicateAppSelections without excluding
+// it. Dropping such an Application would also drop it from an already-released step, leaving it
+// Waiting with nothing to advance it and the rollout stuck until the bound expired.
+func withholdStepsAfter(appDependencyList [][]string, appsToSync map[string]bool, stepIndex int) map[string]bool {
+	released := make(map[string]bool)
+	for step := 0; step <= stepIndex; step++ {
+		for _, appName := range appDependencyList[step] {
+			released[appName] = true
+		}
+	}
+
+	withheld := make(map[string]bool, len(appsToSync))
+	for appName := range appsToSync {
+		withheld[appName] = true
+	}
+	for laterStep := stepIndex + 1; laterStep < len(appDependencyList); laterStep++ {
+		for _, appName := range appDependencyList[laterStep] {
+			if released[appName] {
+				continue
+			}
+			delete(withheld, appName)
+		}
+	}
+
+	return withheld
+}
+
+// findStepRevisionSkew reports an Application pair showing that the step at stepIndex and a later step
+// disagree about the revisions they have observed, or two empty strings when they agree. It proves the
+// disagreement, not its direction -- nothing reachable from here orders two commits.
 //
-// Only an Application in Waiting counts. Waiting is the state the ApplicationSet controller assigns
-// the moment it observes a revision or spec change, so it is the one status that proves a change has
-// reached that Application; Healthy or Progressing means it is finished or already moving and says
-// nothing about revision skew. Requiring it is also what leaves the common reverse case alone: a
-// later-step Application that has simply not been refreshed is not Waiting, so it is never examined.
-//
-// Every later step is considered, not just the immediately following one: a step in between may hold
-// no Waiting Application while a further one does, and releasing everything after this step would be
-// just as wrong.
+// Three choices are deliberate. Only a later-step Application in Waiting counts, because Waiting is
+// the one status that proves the change has reached it, which also leaves the common "not refreshed
+// yet" case alone. Every later step is scanned, not just the next one, since an intervening step may
+// hold nothing Waiting. And of several disagreeing pairs it returns the one whose later-step
+// Application entered Waiting earliest, which is what makes remainingRevisionSkewHold a bound.
 func findStepRevisionSkew(
-	applicationSet argov1alpha1.ApplicationSet,
+	applicationSet *argov1alpha1.ApplicationSet,
 	appDependencyList [][]string,
 	appMap map[string]*argov1alpha1.Application,
 	stepIndex int,
 ) (stepAppName string, laterAppName string) {
-	for _, stepAppName := range appDependencyList[stepIndex] {
-		stepApp, ok := appMap[stepAppName]
+	var anchor *metav1.Time
+
+	for _, stepName := range appDependencyList[stepIndex] {
+		stepApp, ok := appMap[stepName]
 		if !ok {
 			continue
 		}
-		stepRevisions := stepApp.Status.GetRevisions()
-		if len(stepRevisions) == 0 {
-			// Never compared against a revision, so there is nothing to disagree with.
-			continue
-		}
-		stepKeys := applicationSourceKeys(stepApp)
 
 		for laterStep := stepIndex + 1; laterStep < len(appDependencyList); laterStep++ {
-			for _, laterAppName := range appDependencyList[laterStep] {
-				laterApp, ok := appMap[laterAppName]
+			for _, laterName := range appDependencyList[laterStep] {
+				laterApp, ok := appMap[laterName]
 				if !ok {
 					continue
 				}
 
-				idx := utils.FindApplicationStatusIndex(applicationSet.Status.ApplicationStatus, laterAppName)
-				if idx == -1 || applicationSet.Status.ApplicationStatus[idx].Status != argov1alpha1.ProgressiveSyncWaiting {
+				laterStatus := waitingApplicationStatus(applicationSet, laterName)
+				if laterStatus == nil || !revisionsDisagree(stepApp, laterApp) {
 					continue
 				}
 
-				laterRevisions := laterApp.Status.GetRevisions()
-				if len(laterRevisions) == 0 || !reflect.DeepEqual(stepKeys, applicationSourceKeys(laterApp)) {
-					continue
-				}
-
-				if !reflect.DeepEqual(stepRevisions, laterRevisions) {
-					return stepAppName, laterAppName
+				if laterAppName == "" || waitingTransitionBefore(laterStatus.LastTransitionTime, anchor) {
+					stepAppName, laterAppName, anchor = stepName, laterName, laterStatus.LastTransitionTime
 				}
 			}
 		}
 	}
 
-	return "", ""
+	return stepAppName, laterAppName
+}
+
+// revisionsDisagree reports whether two Applications resolve the same Git coordinates but have
+// observed different revisions. Applications on different coordinates may differ forever, and one
+// that has never been compared against a revision has nothing to disagree with, so neither counts.
+func revisionsDisagree(stepApp *argov1alpha1.Application, laterApp *argov1alpha1.Application) bool {
+	stepRevisions, laterRevisions := stepApp.Status.GetRevisions(), laterApp.Status.GetRevisions()
+	if len(stepRevisions) == 0 || len(laterRevisions) == 0 {
+		return false
+	}
+	if !reflect.DeepEqual(applicationSourceKeys(stepApp), applicationSourceKeys(laterApp)) {
+		return false
+	}
+	return !reflect.DeepEqual(stepRevisions, laterRevisions)
+}
+
+// waitingApplicationStatus returns the ApplicationSet's status entry for appName when that entry
+// reads Waiting, and nil when there is no entry or it reads anything else.
+func waitingApplicationStatus(applicationSet *argov1alpha1.ApplicationSet, appName string) *argov1alpha1.ApplicationSetApplicationStatus {
+	idx := utils.FindApplicationStatusIndex(applicationSet.Status.ApplicationStatus, appName)
+	if idx == -1 || applicationSet.Status.ApplicationStatus[idx].Status != argov1alpha1.ProgressiveSyncWaiting {
+		return nil
+	}
+	return &applicationSet.Status.ApplicationStatus[idx]
+}
+
+// waitingTransitionBefore orders two Waiting transitions, treating a missing timestamp as the
+// earliest of all. A hold anchored on a status with no timestamp cannot be shown to end, and the
+// caller releases on the earliest anchor, so an entry with no timestamp must not be able to hide
+// behind a sibling that has one.
+func waitingTransitionBefore(a *metav1.Time, b *metav1.Time) bool {
+	if a == nil {
+		return b != nil
+	}
+	if b == nil {
+		return false
+	}
+	return a.Before(b)
 }
 
 // remainingRevisionSkewHold reports how much of maxRevisionSkewHold is left for the skew involving
-// laterAppName, measured from that Application's own Waiting transition. findStepRevisionSkew only
-// reports an Application that is Waiting, and its transition into Waiting is when the ApplicationSet
-// observed the change this gate is now waiting out, so it is the right clock for this hold.
+// laterAppName, measured from that Application's own Waiting transition, and whether the bound could
+// be evaluated at all. Anchoring on the earliest such transition -- which findStepRevisionSkew
+// selects -- is what stops the deadline drifting as other Applications enter Waiting mid-hold.
 //
-// Deliberately not the newest Waiting transition anywhere in the ApplicationSet: in a many-step
-// ApplicationSet, Applications keep entering Waiting as their own refreshes land, and each one would
-// push the release failsafe further out. The bound has to be a bound.
-//
-// The transition time is already persisted in the ApplicationSet status, so the hold survives a
-// controller restart and needs no new API field.
-func remainingRevisionSkewHold(applicationSet *argov1alpha1.ApplicationSet, laterAppName string, now time.Time) time.Duration {
-	var start time.Time
-	for _, appStatus := range applicationSet.Status.ApplicationStatus {
-		if appStatus.Application != laterAppName || appStatus.Status != argov1alpha1.ProgressiveSyncWaiting {
-			continue
-		}
-		if appStatus.LastTransitionTime != nil {
-			start = appStatus.LastTransitionTime.Time
-		}
-		break
+// The bound is per skew, not per rollout. A new commit re-stamps the Waiting transition and starts a
+// new window, deliberately, since the old disagreement no longer exists; so commits landing on a
+// later step faster than maxRevisionSkewHold, while the earlier step is never refreshed, can keep
+// that step withheld. Every individual hold is still bounded and logged.
+func remainingRevisionSkewHold(applicationSet *argov1alpha1.ApplicationSet, laterAppName string, now time.Time) (time.Duration, bool) {
+	appStatus := waitingApplicationStatus(applicationSet, laterAppName)
+	if appStatus == nil || appStatus.LastTransitionTime == nil {
+		// Nothing to measure against. Every Waiting transition on the write path stamps
+		// LastTransitionTime (progressive_sync.go:438 and :495-496), so this is unreachable through
+		// normal operation and only a status written by something else can produce it. The caller
+		// releases: this gate blocks on what it can prove and on nothing else.
+		return 0, false
 	}
 
-	if start.IsZero() {
-		// No timestamp to measure against, so the bound cannot be evaluated -- and a hold whose bound
-		// cannot be evaluated is not bounded. Every Waiting transition on the write path stamps
-		// LastTransitionTime (progressive_sync.go:440 and :495-496), so this is unreachable through
-		// normal operation and only a status written by something else can produce it. Release rather
-		// than hold forever: this gate blocks on what it can prove and nothing else, and returning a
-		// fresh window here would restart the hold on every requeue.
-		return 0
-	}
-
-	deadline := start.Add(maxRevisionSkewHold)
+	deadline := appStatus.LastTransitionTime.Add(maxRevisionSkewHold)
 	if !now.Before(deadline) {
-		return 0
+		return 0, true
 	}
-	return deadline.Sub(now)
+	return deadline.Sub(now), true
 }
