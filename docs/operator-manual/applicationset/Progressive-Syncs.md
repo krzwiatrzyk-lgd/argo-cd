@@ -104,10 +104,11 @@ evaluated an Application in an earlier step may not have been refreshed yet. It 
 in the *previous* rollout. Releasing the next step on that reading starts a later step against a
 rollout the earlier step has not begun — which is how a RollingSync ends up updating two steps at once.
 
-The ApplicationSet controller therefore withholds a step while an Application in it reports `Healthy`
-for a set of revisions that differ from what an Application in a *later* step, sitting in `Waiting`,
-has observed. `Waiting` is the status the controller assigns the moment it observes a revision or spec
-change, so it is the one status that proves the change has reached that Application.
+The ApplicationSet controller therefore withholds the Applications in a *later* step while an
+Application in an *earlier* step reports `Healthy` for a set of revisions that differ from the ones an
+Application in that later step has observed while sitting in `Waiting`. `Waiting` is the status the
+controller assigns the moment it observes a revision or spec change, so it is the one status that
+proves the change has reached that Application.
 
 Two cases are deliberately not held back, because in both of them the comparison proves nothing and a
 hold would only add latency:
