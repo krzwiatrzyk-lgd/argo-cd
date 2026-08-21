@@ -105,9 +105,9 @@ in the *previous* rollout. Releasing the next step on that reading starts a late
 rollout the earlier step has not begun — which is how a RollingSync ends up updating two steps at once.
 
 The ApplicationSet controller therefore withholds a step while an Application in it reports `Healthy`
-for a set of revisions that an Application in a *later* step, sitting in `Waiting`, has already moved
-past. `Waiting` is the status the controller assigns the moment it observes a revision or spec change,
-so it is the one status that proves the change has reached that Application.
+for a set of revisions that differ from what an Application in a *later* step, sitting in `Waiting`,
+has observed. `Waiting` is the status the controller assigns the moment it observes a revision or spec
+change, so it is the one status that proves the change has reached that Application.
 
 Two cases are deliberately not held back, because in both of them the comparison proves nothing and a
 hold would only add latency:
@@ -124,10 +124,9 @@ controller resolves no revisions of its own. So one uncommon shape is also held:
 earlier step has already moved to the new one. The bound below is what keeps that a delay rather than
 a problem.
 
-The hold is bounded at two minutes, measured from the `Waiting` transition of the later-step
-Application the skew was found against — not from the most recent `Waiting` transition anywhere in the
-ApplicationSet, so that other Applications entering `Waiting` as their own refreshes land cannot push
-the bound out. That bound matters when a commit does not touch an earlier step's
+The hold is bounded at two minutes, measured from the affected later-step Application's `Waiting`
+transition — not from the most recent `Waiting` transition anywhere in the ApplicationSet, so that
+other Applications entering `Waiting` as their own refreshes land cannot push the bound out. That bound matters when a commit does not touch an earlier step's
 [`manifest-generate-paths`](../high_availability.md#manifest-paths-annotation): the earlier
 step's Application is then never refreshed for that commit, and from the ApplicationSet controller this
 is indistinguishable from a refresh that is merely late. Past the bound the step is released and a

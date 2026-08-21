@@ -469,39 +469,42 @@ func TestRemainingRevisionSkewHold(t *testing.T) {
 			expected: 0,
 		},
 		{
-			// A missing timestamp must not release a wave the gate has just decided to withhold, so
-			// the hold restarts rather than reading as expired.
-			name:     "a nil transition time starts the hold fresh",
+			// Without a timestamp the bound cannot be evaluated, and a hold whose bound cannot be
+			// evaluated is not a bound: returning a fresh window here would restart the hold on every
+			// requeue and withhold the step forever. Release instead. Unreachable through the write
+			// path -- every Waiting transition stamps LastTransitionTime -- and the sibling entry with
+			// a valid timestamp must not be borrowed to paper over it.
+			name:     "a nil transition time releases rather than restarting the hold",
 			laterApp: "a",
 			statuses: []argov1alpha1.ApplicationSetApplicationStatus{
 				gateStatus("a", "2", argov1alpha1.ProgressiveSyncWaiting, nil, nil),
 				gateStatus("b", "3", argov1alpha1.ProgressiveSyncWaiting, nil, at(-30*time.Second)),
 			},
-			expected: maxRevisionSkewHold,
+			expected: 0,
 		},
 		{
-			name:     "no status entry for the named application starts the hold fresh",
+			name:     "no status entry for the named application releases",
 			laterApp: "missing",
 			statuses: []argov1alpha1.ApplicationSetApplicationStatus{
 				gateStatus("a", "2", argov1alpha1.ProgressiveSyncWaiting, nil, at(-90*time.Second)),
 			},
-			expected: maxRevisionSkewHold,
+			expected: 0,
 		},
 		{
 			// findStepRevisionSkew only ever names a Waiting Application, so this is defensive: a
 			// status that has moved on since is not a clock this hold may use.
-			name:     "the named application not in waiting starts the hold fresh",
+			name:     "the named application not in waiting releases",
 			laterApp: "a",
 			statuses: []argov1alpha1.ApplicationSetApplicationStatus{
 				gateStatus("a", "2", argov1alpha1.ProgressiveSyncHealthy, nil, at(-90*time.Second)),
 			},
-			expected: maxRevisionSkewHold,
+			expected: 0,
 		},
 		{
-			name:     "no statuses at all starts the hold fresh",
+			name:     "no statuses at all releases",
 			laterApp: "a",
 			statuses: nil,
-			expected: maxRevisionSkewHold,
+			expected: 0,
 		},
 	} {
 		t.Run(cc.name, func(t *testing.T) {

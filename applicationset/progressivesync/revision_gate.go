@@ -234,9 +234,13 @@ func remainingRevisionSkewHold(applicationSet *argov1alpha1.ApplicationSet, late
 	}
 
 	if start.IsZero() {
-		// Nothing to measure against, so the hold is treated as fresh rather than as expired: a
-		// missing timestamp must not release a wave the gate has just decided to withhold.
-		return maxRevisionSkewHold
+		// No timestamp to measure against, so the bound cannot be evaluated -- and a hold whose bound
+		// cannot be evaluated is not bounded. Every Waiting transition on the write path stamps
+		// LastTransitionTime (progressive_sync.go:440 and :495-496), so this is unreachable through
+		// normal operation and only a status written by something else can produce it. Release rather
+		// than hold forever: this gate blocks on what it can prove and nothing else, and returning a
+		// fresh window here would restart the hold on every requeue.
+		return 0
 	}
 
 	deadline := start.Add(maxRevisionSkewHold)
