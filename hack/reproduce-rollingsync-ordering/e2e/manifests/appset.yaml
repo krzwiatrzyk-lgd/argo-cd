@@ -1,0 +1,42 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: rolling
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - list:
+        elements:
+          - name: beta
+          - name: web
+  strategy:
+    type: RollingSync
+    rollingSync:
+      steps:
+        - matchExpressions:
+            - key: step
+              operator: In
+              values: ["beta"]
+        - matchExpressions:
+            - key: step
+              operator: In
+              values: ["web"]
+  template:
+    metadata:
+      name: 'app-{{.name}}'
+      labels:
+        step: '{{.name}}'
+    spec:
+      project: default
+      sources:
+        - repoURL: http://127.0.0.1:9080/repo.git
+          targetRevision: v1
+          path: base
+        - repoURL: http://127.0.0.1:9080/repo.git
+          targetRevision: master
+          path: 'config/{{.name}}'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: 'e2e-{{.name}}'

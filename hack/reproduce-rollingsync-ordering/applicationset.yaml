@@ -1,0 +1,64 @@
+# Two-step RollingSync ApplicationSet used to reproduce the ordering bug described in README.md.
+#
+# __REPO_URL__ is a placeholder: reproduce.sh substitutes it with $REPO_URL before applying. To apply
+# this by hand, replace it with the URL of a git repository you can push to, which must contain
+# `base/` at the tag `rollingsync-repro-base` and `manifests/` on the branch you point at.
+#
+# Two sources on purpose. The first is pinned to a tag and never moves; the second tracks a branch
+# and does. That is the shape the incident had (a pinned chart plus a moving config repo), and it is
+# what populates `status.sync.revisions` with more than one slot.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: rollingsync-ordering-repro
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  strategy:
+    type: RollingSync
+    rollingSync:
+      steps:
+        # Step 1 stands in for the database migration: it must roll out first.
+        - matchExpressions:
+            - key: env
+              operator: In
+              values: [beta]
+        # Step 2 stands in for the web pods: it must not roll out until step 1 is Healthy.
+        - matchExpressions:
+            - key: env
+              operator: In
+              values: [web]
+  generators:
+    - list:
+        elements:
+          - name: rollingsync-repro-beta
+            env: beta
+          - name: rollingsync-repro-web
+            env: web
+  template:
+    metadata:
+      name: '{{.name}}'
+      labels:
+        env: '{{.env}}'
+    spec:
+      project: default
+      # Both Applications must resolve the SAME repoURL and targetRevision in every source slot.
+      # The revision-aware gate compares per-source keys and skips Applications whose keys differ, so
+      # a per-element revision here would make the reproduction untestable against the fix.
+      sources:
+        - repoURL: __REPO_URL__
+          targetRevision: rollingsync-repro-base
+          path: base
+        - repoURL: __REPO_URL__
+          targetRevision: __REPO_BRANCH__
+          path: manifests
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{.name}}'
+      syncPolicy:
+        # RollingSync forces automated sync off on the generated Applications and triggers the syncs
+        # itself; the policy is still what supplies prune and the sync options to those operations.
+        automated:
+          prune: true
+        syncOptions:
+          - CreateNamespace=true
