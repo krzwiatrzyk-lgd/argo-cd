@@ -53,8 +53,10 @@ type refreshResult struct {
 	// behind is the number of Applications that have not observed the revision the rollout is about.
 	// It counts Applications behind, not refreshes issued: see refreshApplicationsBehindRollout.
 	behind int
-	// remaining is how much of maxRefreshHold is left for the oldest skew still outstanding, and is
-	// zero once the bound has elapsed. Only meaningful when behind is greater than zero.
+	// remaining is how much of maxRefreshHold is left for whichever outstanding skew has the most
+	// time on its window, so the decision is deferred while ANY of them is still inside one and taken
+	// once every one of them has passed the bound. Each skew's own window is measured from the oldest
+	// observation the Application behind it disagrees with. Only meaningful when behind is above zero.
 	remaining time.Duration
 }
 

@@ -113,7 +113,8 @@ The wait is bounded at two minutes, measured from the earliest `Waiting` transit
 change being waited on, so that Applications refreshing one after another cannot push the deadline out
 one refresh at a time. An Application that never consumes its refresh — because the Application
 controller is down, is not watching that namespace, or the Application belongs to a shard that is not
-running — carries no error condition and reports nothing new, so no exception can recognise it. Past
+running — carries no error condition and reports nothing new, so the controller cannot tell it apart
+from a refresh that is merely late. Past
 the bound the decision is taken on the state available and a warning is logged, rather than the
 rollout being held for as long as that lasts. While the decision is deferred the ApplicationSet is
 re-examined every ten seconds; that poll is also what makes the wait recover on its own, because a
