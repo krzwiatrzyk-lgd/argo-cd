@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/argoproj/argo-cd/gitops-engine/v3/pkg/health"
 	log "github.com/sirupsen/logrus"
@@ -18,6 +19,10 @@ import (
 
 	"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 )
+
+// fixedNow is the clock every fixture below is measured against, so the cases that exercise the
+// hold's bound do not depend on wall time.
+var fixedNow = time.Date(2026, 8, 21, 12, 2, 27, 0, time.UTC)
 
 const (
 	chartsRepoURL   = "https://github.com/AirHelp/charts.git"
@@ -81,6 +86,13 @@ func newRolloutAppStatus(name string, status v1alpha1.ProgressiveSyncStatusCode,
 	}
 }
 
+// observedAt stamps the Waiting transition the hold is measured from. Statuses without one make the
+// hold start fresh, which is what the cases that are not about the bound want.
+func observedAt(status v1alpha1.ApplicationSetApplicationStatus, at time.Time) v1alpha1.ApplicationSetApplicationStatus {
+	status.LastTransitionTime = new(metav1.NewTime(at))
+	return status
+}
+
 // TestRefreshApplicationsBehindRollout covers the core of --progressive-sync-refresh-all: an
 // Application that still reports the previous revision while another Application in the same
 // ApplicationSet has already registered the new one has not been refreshed yet, and its Healthy is
@@ -97,11 +109,14 @@ func TestRefreshApplicationsBehindRollout(t *testing.T) {
 	}
 
 	for _, cc := range []struct {
-		name            string
-		apps            []v1alpha1.Application
-		appStatuses     []v1alpha1.ApplicationSetApplicationStatus
-		expectedBehind  int
-		expectedPatched []string
+		name           string
+		apps           []v1alpha1.Application
+		appStatuses    []v1alpha1.ApplicationSetApplicationStatus
+		expectedBehind int
+		// expectedRemaining is only meaningful when expectedBehind is greater than zero. Fixtures
+		// whose statuses carry no transition time report the full window: nothing to measure against.
+		expectedRemaining time.Duration
+		expectedPatched   []string
 	}{
 		{
 			name: "refreshes a healthy application still sitting on the previous revision",
@@ -113,8 +128,9 @@ func TestRefreshApplicationsBehindRollout(t *testing.T) {
 				newRolloutAppStatus("app-step1", v1alpha1.ProgressiveSyncHealthy, "1", oldRevisions),
 				newRolloutAppStatus("app-step2", v1alpha1.ProgressiveSyncWaiting, "2", newRevisions),
 			},
-			expectedBehind:  1,
-			expectedPatched: []string{"app-step1"},
+			expectedBehind:    1,
+			expectedRemaining: maxRefreshHold,
+			expectedPatched:   []string{"app-step1"},
 		},
 		{
 			name: "leaves an application that already observed the revision alone",
@@ -142,7 +158,8 @@ func TestRefreshApplicationsBehindRollout(t *testing.T) {
 			},
 			// Still behind: the Application controller has not consumed the annotation yet, so the
 			// caller must keep deferring. Patching it a second time would only churn the object.
-			expectedBehind: 1,
+			expectedBehind:    1,
+			expectedRemaining: maxRefreshHold,
 		},
 		{
 			name: "does nothing when no application has registered a change",
@@ -212,6 +229,62 @@ func TestRefreshApplicationsBehindRollout(t *testing.T) {
 			// An Application that cannot reconcile keeps its old revisions for as long as it is
 			// broken, so counting it would hold the rollout indefinitely. Same fail-open rule
 			// progressive sync already applies via isApplicationWithError.
+			// An Application that never consumes the refresh cannot be recognised by any skip: it
+			// carries no error and reports nothing new. The bound is the only thing that stops it
+			// holding the whole ApplicationSet's rollout for as long as it stays that way.
+			name: "the hold expires once the observation it is waiting on is older than the bound",
+			apps: []v1alpha1.Application{
+				newRolloutApp("app-step1", rolloutSources(), oldRevisions, nil),
+				newRolloutApp("app-step2", rolloutSources(), newRevisions, nil),
+			},
+			appStatuses: []v1alpha1.ApplicationSetApplicationStatus{
+				newRolloutAppStatus("app-step1", v1alpha1.ProgressiveSyncHealthy, "1", oldRevisions),
+				observedAt(newRolloutAppStatus("app-step2", v1alpha1.ProgressiveSyncWaiting, "2", newRevisions), fixedNow.Add(-maxRefreshHold-time.Second)),
+			},
+			expectedBehind:    1,
+			expectedRemaining: 0,
+			expectedPatched:   []string{"app-step1"},
+		},
+		{
+			// The anchor is the OLDEST observation the Application disagrees with, so an Application
+			// that refreshes late and joins the frontier cannot push the deadline out. Without that
+			// rule this fixture would report a nearly full window and hold indefinitely, one late
+			// refresh at a time.
+			// The recent observation is listed FIRST on purpose: an implementation that stopped at the
+			// first frontier entry it disagreed with would anchor on that one and report a nearly
+			// full window. With the order reversed this case passes either way and pins nothing.
+			name: "a late observation does not extend an expired hold",
+			apps: []v1alpha1.Application{
+				newRolloutApp("app-step1", rolloutSources(), oldRevisions, nil),
+				newRolloutApp("app-step2", rolloutSources(), newRevisions, nil),
+				newRolloutApp("app-step3", rolloutSources(), newRevisions, nil),
+			},
+			appStatuses: []v1alpha1.ApplicationSetApplicationStatus{
+				newRolloutAppStatus("app-step1", v1alpha1.ProgressiveSyncHealthy, "1", oldRevisions),
+				observedAt(newRolloutAppStatus("app-step3", v1alpha1.ProgressiveSyncWaiting, "3", newRevisions), fixedNow.Add(-time.Second)),
+				observedAt(newRolloutAppStatus("app-step2", v1alpha1.ProgressiveSyncWaiting, "2", newRevisions), fixedNow.Add(-maxRefreshHold-time.Minute)),
+			},
+			expectedBehind:    1,
+			expectedRemaining: 0,
+			expectedPatched:   []string{"app-step1"},
+		},
+		{
+			// The mirror image: an observation inside the window keeps the full hold, whatever else
+			// has expired around it.
+			name: "an observation inside the window keeps the hold",
+			apps: []v1alpha1.Application{
+				newRolloutApp("app-step1", rolloutSources(), oldRevisions, nil),
+				newRolloutApp("app-step2", rolloutSources(), newRevisions, nil),
+			},
+			appStatuses: []v1alpha1.ApplicationSetApplicationStatus{
+				newRolloutAppStatus("app-step1", v1alpha1.ProgressiveSyncHealthy, "1", oldRevisions),
+				observedAt(newRolloutAppStatus("app-step2", v1alpha1.ProgressiveSyncWaiting, "2", newRevisions), fixedNow.Add(-30*time.Second)),
+			},
+			expectedBehind:    1,
+			expectedRemaining: maxRefreshHold - 30*time.Second,
+			expectedPatched:   []string{"app-step1"},
+		},
+		{
 			name: "does not wait for an application that cannot reconcile",
 			apps: []v1alpha1.Application{
 				withError(newRolloutApp("app-step1", rolloutSources(), oldRevisions, nil)),
@@ -263,10 +336,20 @@ func TestRefreshApplicationsBehindRollout(t *testing.T) {
 			m := NewManager(fakeClient, fakeClient, nil)
 			logCtx := log.NewEntry(log.New())
 
-			appsBehind, err := m.refreshApplicationsBehindRollout(t.Context(), logCtx, &appSet, cc.apps)
+			// The Applications the caller owns, as they went in. client.Patch decodes the API response
+			// into the object it is handed, so patching an element of this slice in place would hand
+			// the rest of the reconcile a mutated Application.
+			callerApps := make([]v1alpha1.Application, len(cc.apps))
+			for i := range cc.apps {
+				cc.apps[i].DeepCopyInto(&callerApps[i])
+			}
+
+			result, err := m.refreshApplicationsBehindRollout(t.Context(), logCtx, &appSet, cc.apps, fixedNow)
 			require.NoError(t, err)
-			assert.Equal(t, cc.expectedBehind, appsBehind, "the count is of applications behind the rollout, not of refreshes issued")
+			assert.Equal(t, cc.expectedBehind, result.behind, "the count is of applications behind the rollout, not of refreshes issued")
+			assert.Equal(t, cc.expectedRemaining, result.remaining, "the hold left for the oldest outstanding skew")
 			assert.ElementsMatch(t, cc.expectedPatched, patched, "only the applications behind the rollout and without a pending refresh may be patched")
+			assert.Equal(t, callerApps, cc.apps, "the applications the caller passed in must not be mutated")
 
 			// An Application nobody patched must come back byte for byte as it went in, which the
 			// resourceVersion proves independently of the Patch interceptor above.
@@ -396,9 +479,10 @@ func TestRefreshApplicationsBehindRolloutAcrossRequeue(t *testing.T) {
 	m := NewManager(fakeClient, fakeClient, nil)
 	logCtx := log.NewEntry(log.New())
 
-	appsBehind, err := m.refreshApplicationsBehindRollout(t.Context(), logCtx, &appSet, apps)
+	result, err := m.refreshApplicationsBehindRollout(t.Context(), logCtx, &appSet, apps, fixedNow)
 	require.NoError(t, err)
-	assert.Equal(t, 1, appsBehind)
+	assert.Equal(t, 1, result.behind)
+	assert.Equal(t, maxRefreshHold, result.remaining, "nothing to measure against, so the hold starts fresh")
 	assert.Equal(t, 1, patchCalls, "the first pass requests the refresh")
 
 	// The requeue arrives before the Application controller has re-compared: the informer cache now
@@ -412,9 +496,9 @@ func TestRefreshApplicationsBehindRolloutAcrossRequeue(t *testing.T) {
 	require.Equal(t, string(v1alpha1.RefreshTypeNormal), refreshed[0].Annotations[v1alpha1.AnnotationKeyRefresh])
 	resourceVersionsBefore := liveResourceVersions(t, fakeClient, refreshed)
 
-	appsBehind, err = m.refreshApplicationsBehindRollout(t.Context(), logCtx, &appSet, refreshed)
+	result, err = m.refreshApplicationsBehindRollout(t.Context(), logCtx, &appSet, refreshed, fixedNow)
 	require.NoError(t, err)
-	assert.Equal(t, 1, appsBehind, "an application whose refresh is still pending is still behind the rollout")
+	assert.Equal(t, 1, result.behind, "an application whose refresh is still pending is still behind the rollout")
 	assert.Equal(t, 1, patchCalls, "the pending refresh must not be re-requested")
 	assert.Equal(t, resourceVersionsBefore, liveResourceVersions(t, fakeClient, refreshed), "no application may be written to on the second pass")
 }
@@ -466,6 +550,18 @@ func TestPerformProgressiveSyncsDefersWhileRefreshPending(t *testing.T) {
 		newStepApp("app-step2", "2", newRevisions),
 	}
 
+	// Every subtest gets its own Applications. The refresh path is handed the caller's slice, and
+	// these subtests run in parallel, so sharing one would make them race each other rather than
+	// test anything.
+	ownApps := func(t *testing.T) []v1alpha1.Application {
+		t.Helper()
+		own := make([]v1alpha1.Application, len(apps))
+		for i := range apps {
+			apps[i].DeepCopyInto(&own[i])
+		}
+		return own
+	}
+
 	newManager := func(t *testing.T, apps []v1alpha1.Application, refreshBeforeSync bool) (*Manager, client.Client) {
 		t.Helper()
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(apps[0].DeepCopy(), apps[1].DeepCopy()).Build()
@@ -479,33 +575,105 @@ func TestPerformProgressiveSyncsDefersWhileRefreshPending(t *testing.T) {
 	t.Run("the flag off releases step 2 against the stale Healthy", func(t *testing.T) {
 		t.Parallel()
 
-		m, _ := newManager(t, apps, false)
-		appsToSync, err := m.PerformProgressiveSyncs(t.Context(), logCtx, *appSet.DeepCopy(), apps, apps)
+		own := ownApps(t)
+		m, _ := newManager(t, own, false)
+		appsToSync, requeue, err := m.PerformProgressiveSyncs(t.Context(), logCtx, *appSet.DeepCopy(), own, own)
 		require.NoError(t, err)
 		assert.True(t, appsToSync["app-step2"], "this is the behaviour the flag exists to change")
+		assert.Zero(t, requeue, "the flag being off must not change the reconcile schedule either")
 	})
 
 	t.Run("the flag on holds step 2 across the requeue", func(t *testing.T) {
 		t.Parallel()
 
-		m, c := newManager(t, apps, true)
+		own := ownApps(t)
+		m, c := newManager(t, own, true)
 
-		appsToSync, err := m.PerformProgressiveSyncs(t.Context(), logCtx, *appSet.DeepCopy(), apps, apps)
+		appsToSync, requeue, err := m.PerformProgressiveSyncs(t.Context(), logCtx, *appSet.DeepCopy(), own, own)
 		require.NoError(t, err)
 		assert.Empty(t, appsToSync, "step 2 must not be released while step 1 reports a stale revision")
+		assert.Equal(t, refreshHoldRequeueInterval, requeue, "a deferred decision must ask to be reconsidered; a later pass patches nothing and so raises no event of its own")
 
 		// The refresh annotation requeues the ApplicationSet immediately, before the Application
 		// controller has had a chance to re-compare.
-		requeued := make([]v1alpha1.Application, 0, len(apps))
-		for i := range apps {
+		requeued := make([]v1alpha1.Application, 0, len(own))
+		for i := range own {
 			var live v1alpha1.Application
-			require.NoError(t, c.Get(t.Context(), types.NamespacedName{Name: apps[i].Name, Namespace: "argocd"}, &live))
+			require.NoError(t, c.Get(t.Context(), types.NamespacedName{Name: own[i].Name, Namespace: "argocd"}, &live))
 			requeued = append(requeued, live)
 		}
 		require.Equal(t, string(v1alpha1.RefreshTypeNormal), requeued[0].Annotations[v1alpha1.AnnotationKeyRefresh])
 
-		appsToSync, err = m.PerformProgressiveSyncs(t.Context(), logCtx, *appSet.DeepCopy(), requeued, requeued)
+		appsToSync, requeue, err = m.PerformProgressiveSyncs(t.Context(), logCtx, *appSet.DeepCopy(), requeued, requeued)
 		require.NoError(t, err)
 		assert.Empty(t, appsToSync, "the pending refresh must keep step 2 closed, not reopen it")
+		assert.Equal(t, refreshHoldRequeueInterval, requeue, "and it must keep asking, or the hold never resolves")
 	})
+
+	t.Run("the hold gives up rather than stalling the rollout", func(t *testing.T) {
+		t.Parallel()
+
+		// Step 2 has been Waiting for longer than maxRefreshHold: whatever is stopping step 1 from
+		// reporting back is not a late refresh. Decide on the state we have. This is the failsafe
+		// that keeps an Application which never consumes its refresh -- no error condition to detect,
+		// so no skip can recognise it -- from holding the rollout for as long as it stays that way.
+		staleAppSet := appSet.DeepCopy()
+		staleAppSet.Status.ApplicationStatus = []v1alpha1.ApplicationSetApplicationStatus{
+			newRolloutAppStatus("app-step1", v1alpha1.ProgressiveSyncHealthy, "1", oldRevisions),
+			observedAt(newRolloutAppStatus("app-step2", v1alpha1.ProgressiveSyncWaiting, "2", newRevisions), time.Now().Add(-maxRefreshHold-time.Minute)),
+		}
+
+		own := ownApps(t)
+		m, _ := newManager(t, own, true)
+
+		appsToSync, requeue, err := m.PerformProgressiveSyncs(t.Context(), logCtx, *staleAppSet, own, own)
+		require.NoError(t, err)
+		assert.True(t, appsToSync["app-step2"], "past the bound the decision is taken on the state available")
+		assert.Zero(t, requeue, "a released wave has nothing left to wait for")
+	})
+}
+
+// TestRemainingRefreshHold pins the clock the hold is measured against.
+func TestRemainingRefreshHold(t *testing.T) {
+	t.Parallel()
+
+	for _, cc := range []struct {
+		name     string
+		anchor   time.Time
+		expected time.Duration
+	}{
+		{
+			name:     "inside the window",
+			anchor:   fixedNow.Add(-30 * time.Second),
+			expected: maxRefreshHold - 30*time.Second,
+		},
+		{
+			name:     "exactly at the bound is expired",
+			anchor:   fixedNow.Add(-maxRefreshHold),
+			expected: 0,
+		},
+		{
+			name:     "well past the bound",
+			anchor:   fixedNow.Add(-24 * time.Hour),
+			expected: 0,
+		},
+		{
+			// A missing timestamp must not release a wave the caller has just decided to hold.
+			name:     "no anchor starts the hold fresh",
+			anchor:   time.Time{},
+			expected: maxRefreshHold,
+		},
+		{
+			// Clock skew between the API server and this controller must neither read as expired nor
+			// buy the hold more than one window.
+			name:     "an anchor in the future is capped at the full window",
+			anchor:   fixedNow.Add(time.Minute),
+			expected: maxRefreshHold,
+		},
+	} {
+		t.Run(cc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, cc.expected, remainingRefreshHold(cc.anchor, fixedNow))
+		})
+	}
 }

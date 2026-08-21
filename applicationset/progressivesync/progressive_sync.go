@@ -107,7 +107,9 @@ func (m *Manager) applicationGoneFromAPIServer(ctx context.Context, namespace, n
 	}
 }
 
-func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry, appset argov1alpha1.ApplicationSet, applications []argov1alpha1.Application, desiredApplications []argov1alpha1.Application) (map[string]bool, error) {
+// PerformProgressiveSyncs returns the Applications allowed to sync in this pass, plus a duration
+// after which the ApplicationSet should be reconciled again, or zero when no such requeue is needed.
+func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry, appset argov1alpha1.ApplicationSet, applications []argov1alpha1.Application, desiredApplications []argov1alpha1.Application) (map[string]bool, time.Duration, error) {
 	// Initialize validation tracking
 	m.validationIssues = &ValidationIssues{}
 
@@ -120,7 +122,7 @@ func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry
 
 	_, err := m.UpdateApplicationSetApplicationStatus(ctx, logCtx, &appset, applications, desiredApplications, appStepMap)
 	if err != nil {
-		return nil, fmt.Errorf("failed to update applicationset app status: %w", err)
+		return nil, 0, fmt.Errorf("failed to update applicationset app status: %w", err)
 	}
 
 	logCtx.Infof("ApplicationSet %v step list:", appset.Name)
@@ -130,21 +132,33 @@ func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry
 
 	appsToSync := getAppsToSync(appset, appDependencyList, applications)
 
+	requeueAfter := time.Duration(0)
 	if m.RefreshApplicationsBeforeSync {
-		appsBehind, err := m.refreshApplicationsBehindRollout(ctx, logCtx, &appset, applications)
+		refresh, err := m.refreshApplicationsBehindRollout(ctx, logCtx, &appset, applications, time.Now())
 		if err != nil {
-			return nil, fmt.Errorf("failed to refresh applications behind the rollout: %w", err)
+			return nil, 0, fmt.Errorf("failed to refresh applications behind the rollout: %w", err)
 		}
-		if appsBehind > 0 {
+
+		switch {
+		case refresh.behind == 0:
+			// Every Application has reported against the same revision, so this pass is deciding on a
+			// coherent picture and needs no help.
+		case refresh.remaining <= 0:
+			// The Application that is behind is not merely late: it has had maxRefreshHold to consume
+			// a refresh and has not. Decide on the state we have rather than hold the rollout for as
+			// long as that lasts, and make the decision visible.
+			logCtx.WithFields(log.Fields{
+				"applications.behind": refresh.behind,
+				"maxHold":             maxRefreshHold,
+			}).Warn("Proceeding with the sync decision while applications are still behind the rollout: they did not report back within the hold window")
+		default:
 			// Some Application is known to be reporting against an older revision than the rollout, so
 			// the state this pass would decide on is mixed: promote nothing and let the decision be
 			// made once every Application has reported against the same revision. This holds for as
-			// long as any Application is behind, whether or not its refresh was requested on this
-			// pass. No explicit requeue is needed: the refresh annotation mutates the Application, and
-			// shouldRequeueForApplication requeues the ApplicationSet on an annotation difference
-			// through its Owns(&Application{}) watch.
+			// long as any Application is behind, whether or not its refresh was requested on this pass.
 			appsToSync = map[string]bool{}
-			logCtx.Infof("Deferring the sync decision, %v application(s) have not observed the current revision", appsBehind)
+			requeueAfter = min(refresh.remaining, refreshHoldRequeueInterval)
+			logCtx.Infof("Deferring the sync decision, %v application(s) have not observed the current revision", refresh.behind)
 		}
 	}
 
@@ -152,7 +166,7 @@ func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry
 
 	_, err = m.UpdateApplicationSetApplicationStatusProgress(ctx, logCtx, &appset, appsToSync, appStepMap)
 	if err != nil {
-		return nil, fmt.Errorf("failed to update applicationset application status progress: %w", err)
+		return nil, 0, fmt.Errorf("failed to update applicationset application status progress: %w", err)
 	}
 
 	progressingCondition := m.getProgressingCondition(&appset)
@@ -160,7 +174,7 @@ func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry
 	conditions := []*argov1alpha1.ApplicationSetCondition{invalidConfigCondition, progressingCondition}
 	_ = m.updateApplicationSetApplicationStatusConditions(ctx, &appset, conditions)
 
-	return appsToSync, nil
+	return appsToSync, requeueAfter, nil
 }
 
 func (m *Manager) PerformReverseDeletion(ctx context.Context, logCtx *log.Entry, appset argov1alpha1.ApplicationSet, currentApps []argov1alpha1.Application) (time.Duration, error) {

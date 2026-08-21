@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -17,10 +18,44 @@ import (
 
 // rolloutRevision pairs the revisions an Application has resolved with the source coordinates those
 // revisions belong to, so that the two are only ever compared between Applications that track the
-// same coordinates.
+// same coordinates. observedAt is the Waiting transition that put it here: the moment the
+// ApplicationSet controller learned about this change, which is what the hold below is measured from.
 type rolloutRevision struct {
 	sourceKeys []string
 	revisions  []string
+	observedAt time.Time
+}
+
+const (
+	// maxRefreshHold bounds how long the sync decision is deferred while an Application has not
+	// reported back against the revision the rollout is about.
+	//
+	// A refresh normally lands in well under a second, so this bound is not for the common case. It
+	// is for an Application that never consumes the annotation at all -- the Application controller
+	// is down, is not watching that namespace, or the Application is assigned to a shard that is not
+	// running. Without a bound that Application holds the whole ApplicationSet's rollout for as long
+	// as it stays that way, which is a worse failure than the race this flag exists to remove.
+	maxRefreshHold = 2 * time.Minute
+
+	// refreshHoldRequeueInterval is how often the ApplicationSet is re-examined while the decision is
+	// deferred. A poll is needed and it is the only thing that makes the hold self-healing: the first
+	// annotation patch requeues through Owns(&Application{}), but a later pass does not patch an
+	// Application that is already annotated, so it produces no event. Without a requeue the
+	// ApplicationSet would stop reconciling entirely and would not resume even once the Application
+	// controller came back and consumed the annotation -- shouldRequeueForApplication ignores
+	// Status.Sync.Revision, and an ApplicationSet generated only by the cluster generator has no
+	// periodic requeue either (ClusterGenerator.GetRequeueAfter returns NoRequeueAfter).
+	refreshHoldRequeueInterval = 10 * time.Second
+)
+
+// refreshResult reports what one refresh pass found.
+type refreshResult struct {
+	// behind is the number of Applications that have not observed the revision the rollout is about.
+	// It counts Applications behind, not refreshes issued: see refreshApplicationsBehindRollout.
+	behind int
+	// remaining is how much of maxRefreshHold is left for the oldest skew still outstanding, and is
+	// zero once the bound has elapsed. Only meaningful when behind is greater than zero.
+	remaining time.Duration
 }
 
 // sourceKeySeparator joins the parts of a source key. A NUL byte cannot appear in any of them, so
@@ -74,10 +109,11 @@ func applicationSourceKeys(app *argov1alpha1.Application) []string {
 // which is indistinguishable from having completed the current one: a RollingSync step reading that
 // state releases the next step against a revision it has never seen.
 //
-// Every skip below is deliberately fail-open. The hold this count drives has no deadline, so an
-// Application that can never converge must not be counted: it would stall the rollout rather than
-// delay it.
-func (m *Manager) refreshApplicationsBehindRollout(ctx context.Context, logCtx *log.Entry, applicationSet *argov1alpha1.ApplicationSet, applications []argov1alpha1.Application) (int, error) {
+// Every skip below is deliberately fail-open: an Application that can never converge must not be
+// counted, because it would turn a delay into a stall. The returned remaining duration is the
+// backstop for the cases no skip can recognise -- an Application that is simply never processed --
+// and is measured from the Waiting transition that started each outstanding skew.
+func (m *Manager) refreshApplicationsBehindRollout(ctx context.Context, logCtx *log.Entry, applicationSet *argov1alpha1.ApplicationSet, applications []argov1alpha1.Application, now time.Time) (refreshResult, error) {
 	appMap := make(map[string]*argov1alpha1.Application, len(applications))
 	for i := range applications {
 		appMap[applications[i].Name] = &applications[i]
@@ -98,15 +134,23 @@ func (m *Manager) refreshApplicationsBehindRollout(ctx context.Context, logCtx *
 		if len(revisions) == 0 {
 			continue
 		}
-		frontier = append(frontier, rolloutRevision{sourceKeys: applicationSourceKeys(app), revisions: revisions})
+		observedAt := time.Time{}
+		if appStatus.LastTransitionTime != nil {
+			observedAt = appStatus.LastTransitionTime.Time
+		}
+		frontier = append(frontier, rolloutRevision{
+			sourceKeys: applicationSourceKeys(app),
+			revisions:  revisions,
+			observedAt: observedAt,
+		})
 	}
 
 	if len(frontier) == 0 {
 		// No Application has registered a change, so there is no revision for the others to be behind.
-		return 0, nil
+		return refreshResult{}, nil
 	}
 
-	appsBehind := 0
+	result := refreshResult{}
 	refreshRequests := 0
 	for _, appStatus := range applicationSet.Status.ApplicationStatus {
 		if appStatus.Status == argov1alpha1.ProgressiveSyncWaiting ||
@@ -127,12 +171,20 @@ func (m *Manager) refreshApplicationsBehindRollout(ctx context.Context, logCtx *
 			continue
 		}
 
+		// The anchor for this Application is the OLDEST observation it disagrees with, not the first
+		// one found. As more Applications refresh and join the frontier, an Application's anchor can
+		// then only move backwards in time, never forwards -- so Applications refreshing one after
+		// another cannot keep pushing the release deadline out. That is the whole point of a bound.
 		sourceKeys := applicationSourceKeys(app)
 		behind := false
+		anchor := time.Time{}
 		for _, observed := range frontier {
-			if reflect.DeepEqual(sourceKeys, observed.sourceKeys) && !reflect.DeepEqual(revisions, observed.revisions) {
-				behind = true
-				break
+			if !reflect.DeepEqual(sourceKeys, observed.sourceKeys) || reflect.DeepEqual(revisions, observed.revisions) {
+				continue
+			}
+			behind = true
+			if !observed.observedAt.IsZero() && (anchor.IsZero() || observed.observedAt.Before(anchor)) {
+				anchor = observed.observedAt
 			}
 		}
 		if !behind {
@@ -148,7 +200,12 @@ func (m *Manager) refreshApplicationsBehindRollout(ctx context.Context, logCtx *
 			continue
 		}
 
-		appsBehind++
+		result.behind++
+		// Hold while ANY outstanding skew is still inside its window, so one Application that has
+		// given up waiting does not release a wave another is still legitimately waiting on.
+		if remaining := remainingRefreshHold(anchor, now); remaining > result.remaining {
+			result.remaining = remaining
+		}
 
 		if _, alreadyRequested := app.Annotations[argov1alpha1.AnnotationKeyRefresh]; alreadyRequested {
 			// A refresh is already pending, patching the same annotation again would only churn the
@@ -157,23 +214,46 @@ func (m *Manager) refreshApplicationsBehindRollout(ctx context.Context, logCtx *
 		}
 
 		patch := client.RawPatch(types.MergePatchType, []byte(`{"metadata":{"annotations":{"`+argov1alpha1.AnnotationKeyRefresh+`":"`+string(argov1alpha1.RefreshTypeNormal)+`"}}}`))
-		if err := m.Client.Patch(ctx, app, patch); err != nil {
+		// Patched through a copy: appMap holds pointers into the applications slice the caller owns,
+		// and client.Patch decodes the API response back into the object it is given. Patching app
+		// directly would hand the rest of the reconcile a mutated Application -- a new
+		// resourceVersion and an annotation it never asked about -- and would make the slice unsafe
+		// for any concurrent reader. Nothing here needs the response.
+		if err := m.Client.Patch(ctx, app.DeepCopy(), patch); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			return appsBehind, fmt.Errorf("failed to request refresh of application %s: %w", app.Name, err)
+			return result, fmt.Errorf("failed to request refresh of application %s: %w", app.Name, err)
 		}
 
 		refreshRequests++
 		logCtx.WithField("app.name", app.Name).Info("Requesting a refresh, the Application has not observed the revision the rollout is about")
 	}
 
-	if appsBehind > 0 {
+	if result.behind > 0 {
 		logCtx.WithFields(log.Fields{
-			"applications.behind":    appsBehind,
+			"applications.behind":    result.behind,
 			"applications.refreshed": refreshRequests,
+			"hold.remaining":         result.remaining,
 		}).Info("Applications have not observed the revision the rollout is about")
 	}
 
-	return appsBehind, nil
+	return result, nil
+}
+
+// remainingRefreshHold reports how much of maxRefreshHold is left for a skew first observed at
+// anchor. A zero anchor means the ApplicationSet status carries no transition time to measure
+// against, in which case the hold starts fresh rather than reading as expired: a missing timestamp
+// must not release a wave the caller has just decided to hold.
+func remainingRefreshHold(anchor time.Time, now time.Time) time.Duration {
+	if anchor.IsZero() {
+		return maxRefreshHold
+	}
+	deadline := anchor.Add(maxRefreshHold)
+	if !now.Before(deadline) {
+		return 0
+	}
+	// An anchor in the future -- clock skew between the API server and this controller -- must not buy
+	// the hold more than one window.
+	return min(deadline.Sub(now), maxRefreshHold)
 }

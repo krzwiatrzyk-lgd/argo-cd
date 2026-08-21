@@ -107,8 +107,19 @@ When enabled, the controller requests a refresh of every Application in the Appl
 not observed the revision the rollout is about, and postpones the decision of which Applications may
 sync to a later reconciliation, once they have reported back. Applications that resolve their
 revisions from different source coordinates, and Applications carrying an error that stops them
-reconciling at all, are not waited on. It is disabled by default, requires progressive syncs to be
-enabled, and is turned on in one of these ways.
+reconciling at all, are not waited on.
+
+The wait is bounded at two minutes, measured from the `Waiting` transition that first recorded the
+change being waited on. An Application that never consumes its refresh — because the Application
+controller is down, is not watching that namespace, or the Application belongs to a shard that is not
+running — carries no error condition and reports nothing new, so no exception can recognise it. Past
+the bound the decision is taken on the state available and a warning is logged, rather than the
+rollout being held for as long as that lasts. While the decision is deferred the ApplicationSet is
+re-examined every ten seconds; that poll is also what makes the wait recover on its own, because a
+pass that finds an Application already annotated patches nothing and so raises no event of its own.
+
+It is disabled by default, requires progressive syncs to be enabled, and is turned on in one of these
+ways.
 
 1. Pass `--progressive-sync-refresh-all` to the ApplicationSet controller args.
 1. Set `ARGOCD_APPLICATIONSET_CONTROLLER_PROGRESSIVE_SYNC_REFRESH_ALL=true` in the ApplicationSet controller environment variables.
