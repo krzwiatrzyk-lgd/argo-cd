@@ -96,6 +96,50 @@ Once each batch of Applications reaches a `Healthy` status, the next batch is sy
 
 If there are any applications that don't match the listed expressions, they will not be synced by the RollingSync strategy and must be manually synced as describe above.
 
+##### Requiring revision consensus before releasing a step
+
+RollingSync releases a step as soon as every Application in the previous step reports `Healthy`, without
+asking which revision that `Healthy` belongs to. The Application controller refreshes Applications
+independently, so an Application that has not been refreshed yet still reports `Synced` and `Healthy`
+against the *previous* commit, which is indistinguishable from having completed the current one. A step
+released on that reading starts against a revision the earlier step has never seen — for example, the web
+tier rolls before the database migration it depends on has run.
+
+`--progressive-sync-require-revision-consensus` (env
+`ARGOCD_APPLICATIONSET_CONTROLLER_PROGRESSIVE_SYNC_REQUIRE_REVISION_CONSENSUS`, or
+`applicationsetcontroller.progressive.sync.require.revision.consensus` in the `argocd-cmd-params-cm`
+ConfigMap; default `false`) makes the controller withhold the whole promotion decision for a pass in which two Applications of the
+ApplicationSet that draw from the same source coordinates report different resolved revisions. Nothing is
+promoted, the ApplicationSet is requeued, and the decision is taken once they agree. It requires
+`--enable-progressive-syncs`.
+
+Applications are compared **per source slot**, so it works with multi-source Applications: a two-source
+and a three-source Application that share one repository are still compared on that repository. Two
+sources are only required to agree when their `repoURL`, `targetRevision`, `chart` and `tagPrefix` all
+match, which is what makes the common patterns safe by construction — a per-cluster branch
+(`targetRevision: '{{.values.branch}}'`), several charts from one Helm repository, or a pinned tag are
+different coordinates and are never compared against each other.
+
+Every other case in which the comparison cannot be trusted is skipped rather than held: an Application
+that has never been compared, a source slot with no resolved revision (a `ref`-only source), an
+Application that is being deleted, one carrying a `ComparisonError`, `InvalidSpecError` or `UnknownError`
+condition, and any Application that no step selects. The gate also does nothing at all unless at least one
+step-selected Application is in `Waiting`, since that is the only status RollingSync ever promotes out of.
+
+The hold is bounded by `--progressive-sync-revision-consensus-timeout` (env
+`ARGOCD_APPLICATIONSET_CONTROLLER_PROGRESSIVE_SYNC_REVISION_CONSENSUS_TIMEOUT`, or
+`applicationsetcontroller.progressive.sync.revision.consensus.timeout` in `argocd-cmd-params-cm`;
+default `2m`, maximum `10m` when set through the environment or the ConfigMap), measured
+from the most recent progressive sync status transition. Past the bound the controller logs a warning and
+promotes anyway, which keeps a rollout from wedging when an Application will never converge — for instance
+when the commit does not touch the paths that Application is generated from, so nothing refreshes it until
+the Application controller's own resync fires (`--app-resync`, upstream default 120s plus up to 60s of
+jitter, and often configured far higher). `0` waits indefinitely.
+
+A value outside the `0`–`10m` range set through the environment or the ConfigMap is **not** clamped:
+`env.ParseDurationFromEnv` logs a warning and falls back to the `2m` default, which is how every other
+duration parameter in Argo CD behaves. The command-line flag is not bounded.
+
 ### Deletion Strategies
 
 The `deletionOrder` field controls the order in which applications are deleted when they are removed from the ApplicationSet. Available values:

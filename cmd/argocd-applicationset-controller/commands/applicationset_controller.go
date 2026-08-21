@@ -65,6 +65,8 @@ func NewCommand() *cobra.Command {
 		debugLog                     bool
 		dryRun                       bool
 		enableProgressiveSyncs       bool
+		requireRevisionConsensus     bool
+		revisionConsensusTimeout     time.Duration
 		enableNewGitFileGlobbing     bool
 		repoServerPlaintext          bool
 		repoServerStrictTLS          bool
@@ -275,6 +277,8 @@ func NewCommand() *cobra.Command {
 				ConcurrentApplicationUpdates: concurrentApplicationUpdates,
 			}
 			appsetReconciler.ProgressiveSyncManager = progressivesync.NewManager(cacheSyncClient, mgr.GetAPIReader(), appsetReconciler)
+			appsetReconciler.ProgressiveSyncManager.RequireRevisionConsensus = requireRevisionConsensus
+			appsetReconciler.ProgressiveSyncManager.RevisionConsensusTimeout = revisionConsensusTimeout
 
 			if err = appsetReconciler.SetupWithManager(mgr, enableProgressiveSyncs, maxConcurrentReconciliations); err != nil {
 				log.Error(err, "unable to create controller", "controller", "ApplicationSet")
@@ -309,6 +313,8 @@ func NewCommand() *cobra.Command {
 	command.Flags().BoolVar(&dryRun, "dry-run", env.ParseBoolFromEnv("ARGOCD_APPLICATIONSET_CONTROLLER_DRY_RUN", false), "Enable dry run mode")
 	command.Flags().BoolVar(&tokenRefStrictMode, "token-ref-strict-mode", env.ParseBoolFromEnv("ARGOCD_APPLICATIONSET_CONTROLLER_TOKENREF_STRICT_MODE", false), fmt.Sprintf("Set to true to require secrets referenced by SCM providers to have the %s=%s label set (Default: false)", common.LabelKeySecretType, common.LabelValueSecretTypeSCMCreds))
 	command.Flags().BoolVar(&enableProgressiveSyncs, "enable-progressive-syncs", env.ParseBoolFromEnv("ARGOCD_APPLICATIONSET_CONTROLLER_ENABLE_PROGRESSIVE_SYNCS", false), "Enable use of the experimental progressive syncs feature.")
+	command.Flags().BoolVar(&requireRevisionConsensus, "progressive-sync-require-revision-consensus", env.ParseBoolFromEnv("ARGOCD_APPLICATIONSET_CONTROLLER_PROGRESSIVE_SYNC_REQUIRE_REVISION_CONSENSUS", false), "Before releasing any progressive sync wave, require that every Application of the ApplicationSet drawing from the same source coordinates has resolved the same revision. Prevents a RollingSync step from being released while the controller is looking at a partially refreshed view of the ApplicationSet. Compares each source slot separately, so it works with multi-source Applications. Requires --enable-progressive-syncs.")
+	command.Flags().DurationVar(&revisionConsensusTimeout, "progressive-sync-revision-consensus-timeout", env.ParseDurationFromEnv("ARGOCD_APPLICATIONSET_CONTROLLER_PROGRESSIVE_SYNC_REVISION_CONSENSUS_TIMEOUT", progressivesync.DefaultRevisionConsensusTimeout, 0, progressivesync.MaxRevisionConsensusTimeout), "How long --progressive-sync-require-revision-consensus may withhold promotions while Applications disagree, measured from the most recent progressive sync status transition. Bounds the wait when an Application never converges, for example because the commit does not touch the paths it is generated from. 0 waits indefinitely.")
 	command.Flags().BoolVar(&enableNewGitFileGlobbing, "enable-new-git-file-globbing", env.ParseBoolFromEnv("ARGOCD_APPLICATIONSET_CONTROLLER_ENABLE_NEW_GIT_FILE_GLOBBING", false), "Enable new globbing in Git files generator.")
 	command.Flags().BoolVar(&repoServerPlaintext, "repo-server-plaintext", env.ParseBoolFromEnv("ARGOCD_APPLICATIONSET_CONTROLLER_REPO_SERVER_PLAINTEXT", false), "Disable TLS on connections to repo server")
 	command.Flags().BoolVar(&repoServerStrictTLS, "repo-server-strict-tls", env.ParseBoolFromEnv("ARGOCD_APPLICATIONSET_CONTROLLER_REPO_SERVER_STRICT_TLS", false), "Whether to use strict validation of the TLS cert presented by the repo server")

@@ -67,9 +67,18 @@ type Manager struct {
 	// event that was never delivered. Required: with no uncached reader the cache cannot be verified,
 	// so past the threshold reverse deletion errors rather than trusting it. Production supplies
 	// mgr.GetAPIReader().
-	APIReader        client.Reader
-	dependencies     Dependencies
-	validationIssues *ValidationIssues // collected during progressive sync execution
+	APIReader client.Reader
+	// RequireRevisionConsensus makes the manager withhold every promotion decision for a pass in
+	// which two Applications that draw from the same source coordinates report different resolved
+	// revisions, which means at least one of them has not been refreshed against the current commit.
+	// Off by default; enabled with --progressive-sync-require-revision-consensus.
+	RequireRevisionConsensus bool
+	// RevisionConsensusTimeout bounds how long RequireRevisionConsensus may withhold promotions.
+	// Zero means hold until the Applications agree. Set with
+	// --progressive-sync-revision-consensus-timeout.
+	RevisionConsensusTimeout time.Duration
+	dependencies             Dependencies
+	validationIssues         *ValidationIssues // collected during progressive sync execution
 }
 
 // NewManager creates a new manager with dependencies
@@ -103,7 +112,9 @@ func (m *Manager) applicationGoneFromAPIServer(ctx context.Context, namespace, n
 	}
 }
 
-func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry, appset argov1alpha1.ApplicationSet, applications []argov1alpha1.Application, desiredApplications []argov1alpha1.Application) (map[string]bool, error) {
+// PerformProgressiveSyncs returns the Applications allowed to sync in this pass, plus a duration
+// after which the ApplicationSet should be reconciled again, or zero when no such requeue is needed.
+func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry, appset argov1alpha1.ApplicationSet, applications []argov1alpha1.Application, desiredApplications []argov1alpha1.Application) (map[string]bool, time.Duration, error) {
 	// Initialize validation tracking
 	m.validationIssues = &ValidationIssues{}
 
@@ -116,7 +127,7 @@ func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry
 
 	_, err := m.UpdateApplicationSetApplicationStatus(ctx, logCtx, &appset, applications, desiredApplications, appStepMap)
 	if err != nil {
-		return nil, fmt.Errorf("failed to update applicationset app status: %w", err)
+		return nil, 0, fmt.Errorf("failed to update applicationset app status: %w", err)
 	}
 
 	logCtx.Infof("ApplicationSet %v step list:", appset.Name)
@@ -124,12 +135,48 @@ func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry
 		logCtx.Infof("step %v: %+v", stepIndex+1, applicationNames)
 	}
 
-	appsToSync := getAppsToSync(appset, appDependencyList, applications)
+	// The statuses are current at this point, so the gate below is evaluated against what this pass
+	// has just observed rather than against the previous reconciliation, and it runs before any
+	// Application is promoted to Pending.
+	appsToSync := map[string]bool{}
+	requeueAfter := time.Duration(0)
+	deferSyncDecision := false
+
+	if m.RequireRevisionConsensus {
+		consensus := evaluateRevisionConsensus(&appset, applications, appStepMap, m.RevisionConsensusTimeout, time.Now())
+		switch {
+		case consensus.Hold:
+			// Two Applications drawing from the same source coordinates disagree on the revision
+			// they resolved, so this pass is looking at a torn view: some Applications have been
+			// refreshed against the new commit and some have not. An unrefreshed Application still
+			// reports Synced and Healthy against the previous commit, which is indistinguishable
+			// from having completed the current one, and releasing a wave on that reading starts a
+			// later step against a rollout an earlier step has not begun. Promote nothing and take
+			// the decision once they agree.
+			deferSyncDecision = true
+			requeueAfter = consensus.RequeueAfter()
+			logCtx.WithFields(log.Fields{
+				"consensus.slot":      consensus.Slot.String(),
+				"consensus.revisions": consensus.LogDetail(),
+				"consensus.remaining": consensus.Remaining,
+			}).Info("Holding progressive sync rollout decision: Applications sharing a source have not converged on one revision")
+		case consensus.Expired:
+			logCtx.WithFields(log.Fields{
+				"consensus.slot":      consensus.Slot.String(),
+				"consensus.revisions": consensus.LogDetail(),
+				"consensus.timeout":   m.RevisionConsensusTimeout,
+			}).Warn("Applications sharing a source have not converged on one revision within the consensus timeout, promoting anyway")
+		}
+	}
+
+	if !deferSyncDecision {
+		appsToSync = getAppsToSync(appset, appDependencyList, applications)
+	}
 	logCtx.Infof("Application allowed to sync before maxUpdate?: %+v", appsToSync)
 
 	_, err = m.UpdateApplicationSetApplicationStatusProgress(ctx, logCtx, &appset, appsToSync, appStepMap)
 	if err != nil {
-		return nil, fmt.Errorf("failed to update applicationset application status progress: %w", err)
+		return nil, 0, fmt.Errorf("failed to update applicationset application status progress: %w", err)
 	}
 
 	progressingCondition := m.getProgressingCondition(&appset)
@@ -137,7 +184,10 @@ func (m *Manager) PerformProgressiveSyncs(ctx context.Context, logCtx *log.Entry
 	conditions := []*argov1alpha1.ApplicationSetCondition{invalidConfigCondition, progressingCondition}
 	_ = m.updateApplicationSetApplicationStatusConditions(ctx, &appset, conditions)
 
-	return appsToSync, nil
+	// The caller has to requeue on this: neither the consensus bound elapsing nor an Application
+	// refreshing into agreement is an event any watch reports, so without the hint nothing would
+	// wake the controller to take the deferred decision.
+	return appsToSync, requeueAfter, nil
 }
 
 func (m *Manager) PerformReverseDeletion(ctx context.Context, logCtx *log.Entry, appset argov1alpha1.ApplicationSet, currentApps []argov1alpha1.Application) (time.Duration, error) {
