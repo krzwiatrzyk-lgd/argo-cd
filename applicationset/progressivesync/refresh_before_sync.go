@@ -28,21 +28,16 @@ type rolloutRevision struct {
 
 const (
 	// maxRefreshHold bounds how long the sync decision is deferred while an Application has not
-	// reported back against the revision the rollout is about.
-	//
-	// A refresh normally lands in well under a second, so this bound is not for the common case. It
-	// is for an Application that never consumes the annotation at all -- the Application controller
-	// is down, is not watching that namespace, or the Application is assigned to a shard that is not
-	// running. Without a bound that Application holds the whole ApplicationSet's rollout for as long
-	// as it stays that way, which is a worse failure than the race this flag exists to remove.
+	// reported back. A refresh normally lands in under a second, so the bound is not for the common
+	// case: it is for an Application that never consumes the annotation at all -- controller down,
+	// namespace unwatched, shard not running. Holding a whole rollout on one such Application would
+	// be a worse failure than the race this flag removes.
 	maxRefreshHold = 2 * time.Minute
 
-	// refreshHoldRequeueInterval is how often the ApplicationSet is re-examined while the decision is
-	// deferred. A poll is needed and it is the only thing that makes the hold self-healing: the first
-	// annotation patch requeues through Owns(&Application{}), but a later pass does not patch an
-	// Application that is already annotated, so it produces no event. Without a requeue the
-	// ApplicationSet would stop reconciling entirely and would not resume even once the Application
-	// controller came back and consumed the annotation -- shouldRequeueForApplication ignores
+	// refreshHoldRequeueInterval re-examines the ApplicationSet while the decision is deferred, and is
+	// the only thing that makes the hold self-healing. The first annotation patch requeues through
+	// Owns(&Application{}), but a later pass does not re-patch an already-annotated Application and so
+	// produces no event, and shouldRequeueForApplication ignores
 	// Status.Sync.Revision, and an ApplicationSet generated only by the cluster generator has no
 	// periodic requeue either (ClusterGenerator.GetRequeueAfter returns NoRequeueAfter).
 	refreshHoldRequeueInterval = 10 * time.Second
@@ -53,10 +48,9 @@ type refreshResult struct {
 	// behind is the number of Applications that have not observed the revision the rollout is about.
 	// It counts Applications behind, not refreshes issued: see refreshApplicationsBehindRollout.
 	behind int
-	// remaining is how much of maxRefreshHold is left for whichever outstanding skew has the most
-	// time on its window, so the decision is deferred while ANY of them is still inside one and taken
-	// once every one of them has passed the bound. Each skew's own window is measured from the oldest
-	// observation the Application behind it disagrees with. Only meaningful when behind is above zero.
+	// remaining is the largest window left across the outstanding skews, so the decision waits while
+	// ANY of them is still inside its bound. Each skew's own window runs from the oldest observation
+	// the Application behind it disagrees with. Only meaningful when behind is above zero.
 	remaining time.Duration
 }
 
@@ -65,23 +59,15 @@ type refreshResult struct {
 const sourceKeySeparator = "\x00"
 
 // applicationSourceKeys identifies the coordinates an Application resolves its revisions from, in
-// spec source order. Two Applications sharing these coordinates must converge on the same resolved
-// revisions, so a difference between them means one has not been refreshed yet. Applications with
-// different coordinates legitimately sit at different revisions and are skipped.
+// spec source order. Two Applications sharing these coordinates must converge on the same revisions;
+// Applications with different coordinates legitimately differ forever and are skipped, since demanding
+// a consensus that cannot arrive would wedge the rollout.
 //
-// A field belongs in the key if and only if it changes which revision the source resolves to:
-//   - RepoURL and TargetRevision: the repository and the requested ref or version constraint.
-//   - Chart: for a Helm repository repoURL@targetRevision is not a source at all. The same repo at
-//     18.* with chart redis and with chart postgres are two different resolutions, and grouping them
-//     would demand a consensus that is impossible by construction.
-//   - TagPrefix: it filters which git tags a semver TargetRevision may resolve to and is re-added to
-//     the resolved version, so the same repo and constraint with different prefixes resolve to
-//     permanently different revisions.
-//
-// Path is deliberately absent: it changes what is rendered from a revision, not which revision is
-// resolved, and per-Application paths are the normal ApplicationSet shape, so including it would
-// stop the comparison seeing the Applications it exists to compare. So are Ref, Name and the
-// per-tool option blocks.
+// A field belongs in the key if and only if it changes which revision the source resolves to. Chart
+// qualifies because for a Helm repository repoURL@targetRevision is not a source at all, and TagPrefix
+// because it filters which tags a semver constraint may match. Path, Ref, Name and the per-tool option
+// blocks do not: they change what is rendered from a revision, and per-Application paths are the
+// normal ApplicationSet shape, so keying on them would hide the very Applications this compares.
 func applicationSourceKeys(app *argov1alpha1.Application) []string {
 	sources := app.Spec.GetSources()
 	keys := make([]string, 0, len(sources))
@@ -100,21 +86,14 @@ func applicationSourceKeys(app *argov1alpha1.Application) []string {
 // in the ApplicationSet that has not observed the revision the rollout is about, and returns how
 // many Applications are behind it.
 //
-// The returned count is the number of Applications still behind, not the number of refreshes
-// issued: an Application whose refresh is already pending is counted but not patched again. The
-// annotation write itself requeues the ApplicationSet, usually well before the Application
-// controller has consumed it, so a count of refreshes issued would drop to zero on that requeue and
-// release the very step this exists to hold.
+// The count is Applications still behind, not refreshes issued: one whose refresh is already pending
+// is counted but not patched again. Counting refreshes instead would drop to zero on the requeue the
+// annotation write itself triggers -- usually before the Application controller has consumed it --
+// and release the step this exists to hold.
 //
-// The Application controller refreshes Applications independently, milliseconds apart. Until an
-// Application has been refreshed it still reports Synced and Healthy against the previous revision,
-// which is indistinguishable from having completed the current one: a RollingSync step reading that
-// state releases the next step against a revision it has never seen.
-//
-// Every skip below is deliberately fail-open: an Application that can never converge must not be
-// counted, because it would turn a delay into a stall. The returned remaining duration is the
-// backstop for the cases no skip can recognise -- an Application that is simply never processed --
-// and is measured from the Waiting transition that started each outstanding skew.
+// Every skip below is deliberately fail-open, because an Application that can never converge would
+// turn a delay into a stall. The returned remaining duration is the backstop for the case no skip can
+// recognise: an Application that is simply never processed.
 func (m *Manager) refreshApplicationsBehindRollout(ctx context.Context, logCtx *log.Entry, applicationSet *argov1alpha1.ApplicationSet, applications []argov1alpha1.Application, now time.Time) (refreshResult, error) {
 	appMap := make(map[string]*argov1alpha1.Application, len(applications))
 	for i := range applications {
@@ -243,15 +222,12 @@ func (m *Manager) refreshApplicationsBehindRollout(ctx context.Context, logCtx *
 	return result, nil
 }
 
-// remainingRefreshHold reports how much of maxRefreshHold is left for a skew first observed at
-// anchor.
+// remainingRefreshHold reports how much of maxRefreshHold is left for a skew first observed at anchor.
 //
-// A zero anchor means the ApplicationSet status carries no transition time to measure against, so
-// the bound cannot be evaluated -- and a hold whose bound cannot be evaluated is not bounded. The
-// caller re-evaluates on every requeue, so returning a full window here would restart the hold each
-// time and defer the decision forever. Report it as expired instead: the caller then decides on the
-// state available and logs a warning. Unreachable through the write path, where both transitions
-// into ProgressiveSyncWaiting stamp LastTransitionTime (progressive_sync.go:440 and :495-496).
+// A zero anchor is reported as expired, not as a full window: the caller re-evaluates on every
+// requeue, so a fresh window each time would defer the decision forever, and a hold whose bound
+// cannot be evaluated is not bounded. Unreachable through the write path, where both transitions into
+// ProgressiveSyncWaiting stamp LastTransitionTime (progressive_sync.go:440 and :495-496).
 func remainingRefreshHold(anchor time.Time, now time.Time) time.Duration {
 	if anchor.IsZero() {
 		return 0
