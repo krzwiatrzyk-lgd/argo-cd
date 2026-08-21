@@ -16,13 +16,15 @@ This harness is the slow, high-fidelity counterpart: nothing is mocked, the obse
 | Tool | Used for |
 |---|---|
 | `docker` | k3d's node container and the redis container |
-| `k3d` | creates and deletes a single-node k3s cluster |
+| `k3d` | creates the single-node k3s cluster, and deletes it when asked to |
 | `kubectl` | everything against that cluster |
 | `go` | builds `./cmd` twice, once per variant |
 | `git` | the fixture repository, and `git http-backend` server-side |
 | `python3` | a ~60-line CGI wrapper around `git http-backend` |
 
-It **creates and deletes a k3d cluster** named `argocd-repro`, binds `127.0.0.1:9080` (git),
+`up.sh` **creates a k3d cluster** named `argocd-repro` if one is not already there, and reuses it
+otherwise. `down.sh` leaves it running, because creating it is the slowest part of `up.sh`; pass
+`DELETE_CLUSTER=1` to remove it too. The harness binds `127.0.0.1:9080` (git),
 `:8081` (repo-server), `:12345`/`:12346`/`:7001` (ApplicationSet controller), and starts a
 container named `argocd-redis`. It writes only inside this directory and `/tmp/argocd-local`.
 
@@ -44,6 +46,7 @@ FIX_TREE=/tmp/argocd-fix ./up.sh
 ./reproduce.sh fix1  165    # Verdict C: the hold is bounded, and releases at 120s
 
 ./down.sh                   # --purge also drops binaries, the git root and logs
+                            # DELETE_CLUSTER=1 ./down.sh --purge  removes the cluster as well
 ```
 
 `up.sh` is the slow part: two `go build ./cmd` runs, several minutes each on a cold module cache,
