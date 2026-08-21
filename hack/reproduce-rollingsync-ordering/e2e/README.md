@@ -23,8 +23,8 @@ This harness is the slow, high-fidelity counterpart: nothing is mocked, the obse
 | `python3` | a ~60-line CGI wrapper around `git http-backend` |
 
 `up.sh` **creates a k3d cluster** named `argocd-repro` if one is not already there, and reuses it
-otherwise. `down.sh` leaves it running, because creating it is the slowest part of `up.sh`; pass
-`DELETE_CLUSTER=1` to remove it too. The harness binds `127.0.0.1:9080` (git),
+otherwise. `down.sh` leaves it running, because creating it is the slowest part of `up.sh`; only
+`DELETE_CLUSTER=1 ./down.sh --purge` removes it, since the check sits inside `--purge`. The harness binds `127.0.0.1:9080` (git),
 `:8081` (repo-server), `:12345`/`:12346`/`:7001` (ApplicationSet controller), and starts a
 container named `argocd-redis`. It writes only inside this directory and `/tmp/argocd-local`.
 
@@ -48,6 +48,10 @@ FIX_TREE=/tmp/argocd-fix ./up.sh
 ./down.sh                   # --purge also drops binaries, the git root and logs
                             # DELETE_CLUSTER=1 ./down.sh --purge  removes the cluster as well
 ```
+
+`up.sh` finishes by starting a baseline applicationset-controller, because an ApplicationSet on its
+own generates nothing and `reproduce.sh` refreshes the two Applications before starting its own
+controller. Each `reproduce.sh` replaces that controller with the binary under test.
 
 `up.sh` is the slow part: two `go build ./cmd` runs, several minutes each on a cold module cache,
 plus the cluster and the `manifests/install.yaml` apply. Both binaries are cached in `bin/`, so a

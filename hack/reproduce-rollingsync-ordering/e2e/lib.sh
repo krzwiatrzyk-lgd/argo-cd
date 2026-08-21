@@ -128,6 +128,38 @@ start_appset_controller() {
         --argocd-repo-server "localhost:$REPO_SERVER_PORT"
 }
 
+# Build one variant binary, keyed on the revision of the tree it comes from. Keying on the file alone
+# would silently reuse a binary from a previous BASELINE_TREE or FIX_TREE, and a run that labels its
+# result "fix1" while executing something else is worse than no run at all.
+# $1 = binary name, $2 = source tree
+build_variant() {
+  local name="$1" tree="$2"
+  local stampfile="$BIN/$name.rev"
+  local want cached
+
+  if [ -n "$(git -C "$tree" status --porcelain 2>/dev/null)" ]; then
+    # A dirty tree has no stable identity, so never trust a cached binary against one.
+    want=""
+    say "building $name from $tree (uncommitted changes, so always rebuilt)"
+  else
+    want="$(git -C "$tree" rev-parse HEAD)"
+    cached="$(cat "$stampfile" 2>/dev/null || true)"
+    if [ -x "$BIN/$name" ] && [ "$cached" = "$want" ]; then
+      return 0
+    fi
+    if [ -x "$BIN/$name" ]; then
+      say "rebuilding $name: $tree is at ${want:0:8}, cached binary came from ${cached:-an unrecorded revision}"
+    else
+      say "building $name from $tree (several minutes on a cold Go cache)"
+    fi
+  fi
+
+  rm -f "$stampfile"
+  (cd "$tree" && go build -o "$BIN/$name" ./cmd) || die "$name build failed"
+  [ -n "$want" ] && echo "$want" > "$stampfile"
+  return 0
+}
+
 # Publish the current master of the working tree through the bare repo.
 git_publish() {
   git -C "$GITROOT/work" push -q "$GITROOT/repo.git" master --force

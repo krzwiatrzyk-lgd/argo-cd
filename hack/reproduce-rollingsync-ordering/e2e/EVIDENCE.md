@@ -432,9 +432,11 @@ Two further honesty notes:
 - **No webhook was configured at all.** The `manifest-generate-paths` optimisation that made the race
   visible in the reported incident is not exercised.
 - **Two Applications, one per step, one commit.** No `maxUpdate`, no multi-Application steps, no more
-  than two steps, no cluster generator (this is a list generator, so unlike the incident's cluster
-  generator it *does* have a periodic requeue — findings F1/F2 mean the fix's requeue hint is
-  load-bearing in production in a way this harness does not test).
+  than two steps, no cluster generator. Note that `ListGenerator.GetRequeueAfter` returns
+  `NoRequeueAfter` (`applicationset/generators/list.go:24-26`), exactly as the cluster generator does,
+  so this harness has no periodic requeue either — the fix's requeue hint is therefore load-bearing
+  here as well as in production, and the holds observed below could not have been released by a
+  periodic resync that does not exist.
 - **ConfigMaps, not workloads.** They go Synced/Healthy instantly. Nothing here exercises a step that
   takes real time to become Healthy, a step that fails, or a sync that has to be retried — and a
   slow or flapping step 1 is precisely where a bounded hold's 2-minute budget is most likely to run

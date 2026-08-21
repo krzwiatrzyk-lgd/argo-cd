@@ -114,8 +114,23 @@ echo "new_commit=$NEW_COMMIT" >> "$RUNDIR/run.env"
 echo "new_release=$NEW_RELEASE" >> "$RUNDIR/run.env"
 
 ########## 4. refresh ONLY the step-2 Application ##########
+# Hard, not normal: a normal refresh may be answered from the repo-server's revision cache, leaving
+# app-web on the old revision. The whole experiment is the skew, so if app-web never observes the new
+# commit there is nothing for the gate to act on and phase 1 would report "no violation" without
+# having tested anything. Assert the skew exists rather than assume the refresh produced it.
 say "refreshing ONLY app-web (step 2). app-beta is left believing it is Synced on the old commit."
-kubectl -n argocd annotate app app-web argocd.argoproj.io/refresh=normal --overwrite >/dev/null
+kubectl -n argocd annotate app app-web argocd.argoproj.io/refresh=hard --overwrite >/dev/null
+for _ in $(seq 1 40); do
+  [ "$(kubectl -n argocd get app app-web -o jsonpath='{.status.sync.revisions[1]}' 2>/dev/null)" = "$NEW_COMMIT" ] && break
+  sleep 3
+done
+WEB_REV="$(kubectl -n argocd get app app-web -o jsonpath='{.status.sync.revisions[1]}' 2>/dev/null)"
+[ "$WEB_REV" = "$NEW_COMMIT" ] \
+  || { say "ABORT: app-web never observed $NEW_COMMIT (it reports ${WEB_REV:-nothing}), so there is no skew to test"; exit 1; }
+BETA_REV="$(kubectl -n argocd get app app-beta -o jsonpath='{.status.sync.revisions[1]}' 2>/dev/null)"
+[ "$BETA_REV" != "$NEW_COMMIT" ] \
+  || { say "ABORT: app-beta also observed $NEW_COMMIT, so the skew this experiment needs is gone"; exit 1; }
+say "skew established: app-web on $NEW_COMMIT, app-beta still on ${BETA_REV:-nothing}"
 
 ########## 5. did step 2 run ahead of step 1? ##########
 VIOLATION=no

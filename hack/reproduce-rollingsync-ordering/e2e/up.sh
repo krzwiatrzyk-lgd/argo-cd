@@ -113,13 +113,9 @@ git ls-remote "http://127.0.0.1:$GIT_PORT/repo.git" >/dev/null 2>&1 \
   || die "git server not answering. Note go-git needs the SMART protocol; a static file server is not enough"
 
 ########## 3. binaries ##########
-if [ ! -x "$BIN/argocd-master" ]; then
-  say "building argocd-master from $BASELINE_TREE (several minutes on a cold Go cache)"
-  (cd "$BASELINE_TREE" && go build -o "$BIN/argocd-master" ./cmd) || die "master build failed"
-fi
-if [ -n "$FIX_TREE" ] && [ ! -x "$BIN/argocd-fix1" ]; then
-  say "building argocd-fix1 from $FIX_TREE"
-  (cd "$FIX_TREE" && go build -o "$BIN/argocd-fix1" ./cmd) || die "fix1 build failed"
+build_variant argocd-master "$BASELINE_TREE"
+if [ -n "$FIX_TREE" ]; then
+  build_variant argocd-fix1 "$FIX_TREE"
 fi
 if [ -z "$FIX_TREE" ]; then
   say "note: FIX_TREE is unset, so only 'reproduce.sh master' can run; see README.md"
@@ -190,5 +186,19 @@ say "sanity gate passed"
 ########## 6. the ApplicationSet under test ##########
 say "applying the two-step RollingSync ApplicationSet"
 appset_manifest | kubectl apply -f - >/dev/null
+
+# An ApplicationSet on its own generates nothing: only the applicationset-controller creates the two
+# Applications, and reproduce.sh starts its controller AFTER refreshing them, so without this a fresh
+# harness would fail its first run at the baseline step with nothing to refresh. The baseline binary
+# is used because every run replaces this controller with the one under test anyway.
+say "starting the baseline applicationset-controller to generate the Applications"
+start_appset_controller "$BIN/argocd-master" applicationset-controller-bootstrap
+for _ in $(seq 1 60); do
+  kubectl -n argocd get app app-beta app-web >/dev/null 2>&1 && break
+  sleep 2
+done
+kubectl -n argocd get app app-beta app-web >/dev/null 2>&1 \
+  || die "the ApplicationSet generated no Applications; see $LOGS/applicationset-controller-bootstrap.log"
+say "both Applications exist"
 
 say "up. Now run:  ./reproduce.sh master   and   ./reproduce.sh fix1"
