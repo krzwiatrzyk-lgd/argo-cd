@@ -30,11 +30,11 @@ Waiting.
 
 The incident this reproduces logged, in one reconcile:
 
-	Application allowed to sync before maxUpdate?: map[grafana-beta2-sta:true grafana-web1-sta:true]
-	triggering sync for application: grafana-web1-sta, prune enabled: true
+	Application allowed to sync before maxUpdate?: map[app-beta:true app-web:true]
+	triggering sync for application: app-web, prune enabled: true
 	Initialized new operation: {&SyncOperation{Revision:,Prune:true,...,Revisions:[],...}
 
-while grafana-beta2-sta (step 1, the database migration) had not started its rollout at all. The
+while app-beta (step 1, the database migration) had not started its rollout at all. The
 step-1 Application logs nothing on the way through: the status line at progressive_sync.go:541 is
 guarded on the pointer identity newAppStatus.LastTransitionTime == &now, so an Application whose
 status is left untouched is silent. Its silence is part of the signature.
@@ -58,14 +58,14 @@ progressive_sync_dependencies_test.go:890-905 -- is used instead.
 const (
 	// Coordinates from the incident. Both Applications are two-source and share every coordinate;
 	// only the config source's resolved revision differs, which is exactly what production showed.
-	chartRepo    = "https://github.com/AirHelp/charts.git"
-	configRepo   = "https://github.com/AirHelp/ah-config.git"
+	chartRepo    = "https://github.com/example-org/charts.git"
+	configRepo   = "https://github.com/example-org/config.git"
 	chartRev     = "6a23cff31f9ee99d7276dd35b286b6b267a00dfd" // identical for both Applications
 	oldConfigRev = "540d762f792763ced1c71d97d79b0020a6dbc099"
 	newConfigRev = "02d86d2a072b33ac9177c8de3c37649ed4804dbd"
 
-	orderingStep1App = "grafana-beta2-sta" // step 1: the migration
-	orderingStep2App = "grafana-web1-sta"  // step 2: the web pods
+	orderingStep1App = "app-beta" // step 1: the migration
+	orderingStep2App = "app-web"  // step 2: the web pods
 )
 
 // orderingPreviousRollout is when the previous rollout completed. Absolute rather than
@@ -92,12 +92,12 @@ func orderingLiveApp(name, env string, observedRevisions []string, syncStatus v1
 		},
 		Spec: v1alpha1.ApplicationSpec{
 			Project: "default",
-			// Both sources track master, as they did in the incident. Only ah-config's master
+			// Both sources track master, as they did in the incident. Only config's master
 			// moved, which is why the first revision slot is identical on both Applications and the
 			// second is not.
 			Sources: []v1alpha1.ApplicationSource{
-				{RepoURL: chartRepo, Path: "charts/grafana", TargetRevision: "master"},
-				{RepoURL: configRepo, Path: "grafana", TargetRevision: "master", Ref: "values"},
+				{RepoURL: chartRepo, Path: "charts/web", TargetRevision: "master"},
+				{RepoURL: configRepo, Path: "web", TargetRevision: "master", Ref: "values"},
 			},
 			Destination: v1alpha1.ApplicationDestination{
 				Server:    "https://kubernetes.default.svc",
@@ -142,7 +142,7 @@ func orderingAppSet() v1alpha1.ApplicationSet {
 	}
 
 	return v1alpha1.ApplicationSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "grafana", Namespace: "argocd"},
+		ObjectMeta: metav1.ObjectMeta{Name: "rolling", Namespace: "argocd"},
 		Spec: v1alpha1.ApplicationSetSpec{
 			Strategy: &v1alpha1.ApplicationSetStrategy{
 				Type: "RollingSync",
@@ -266,7 +266,7 @@ func TestRollingSyncReleasesLaterStepOnStaleHealthy(t *testing.T) {
 	assert.Equal(t, []string{chartRev, newConfigRev}, step2Status.TargetRevisions)
 
 	// The bug, byte for byte the incident's log line:
-	// Application allowed to sync before maxUpdate?: map[grafana-beta2-sta:true grafana-web1-sta:true]
+	// Application allowed to sync before maxUpdate?: map[app-beta:true app-web:true]
 	assert.Equal(t, map[string]bool{orderingStep1App: true, orderingStep2App: true}, appsToSync,
 		"BUG: step 2 is released while step 1 still reports Healthy for %v and step 2 has already observed %v",
 		[]string{chartRev, oldConfigRev}, []string{chartRev, newConfigRev})
