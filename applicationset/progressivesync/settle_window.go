@@ -7,19 +7,15 @@ import (
 )
 
 // MaxSettleWindow is the largest quiet period --progressive-sync-settle-window will honour. It is
-// enforced here rather than only at the flag, because env.ParseDurationFromEnv bounds only the
-// environment-derived default: a value passed on the command line reaches the Manager unchecked, and
-// the Manager's SettleWindow field is exported. Enforcing the bound at the point of use makes the
-// documented maximum true however the value arrived.
+// enforced at the point of use, not only at the flag: env.ParseDurationFromEnv bounds only the
+// environment-derived default, and Manager.SettleWindow is exported, so a bound checked anywhere else
+// would not hold.
 const MaxSettleWindow = 5 * time.Minute
 
-// NormalizeSettleWindow clamps a configured settle window into [0, MaxSettleWindow].
-//
-// A negative window means disabled, which is the same as zero: there is no sensible reading of "wait
-// for minus one second". A window past the maximum is clamped rather than rejected, so an operator
-// who asks for too long a quiet period gets the longest supported one instead of a controller that
-// refuses to start. Callers that can report the difference to a human should do so -- silently
-// honouring something other than what was configured is its own kind of bug.
+// NormalizeSettleWindow clamps a configured settle window into [0, MaxSettleWindow]. A negative window
+// means disabled; one past the maximum is clamped rather than rejected, so too long a quiet period
+// degrades to the longest supported one instead of refusing to start. Callers that can report the
+// substitution to a human should, since silently honouring something else is its own kind of bug.
 func NormalizeSettleWindow(window time.Duration) time.Duration {
 	switch {
 	case window < 0:
