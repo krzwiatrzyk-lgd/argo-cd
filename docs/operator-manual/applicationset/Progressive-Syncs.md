@@ -59,7 +59,8 @@ When the ApplicationSet changes, the changes will be applied to each group of Ap
 - All `matchExpressions` must be true for an Application to be selected (multiple expressions match with AND behavior).
 - The `In` and `NotIn` operators must match at least one value to be considered true (OR behavior).
 - The `NotIn` operator has priority in the event that both a `NotIn` and `In` operator produce a match.
-- All Applications in each group must become Healthy for the revision being rolled out before the ApplicationSet controller will proceed to update the next group of Applications. See [Revision-aware step gating](#revision-aware-step-gating).
+- All Applications in each group must become Healthy before the ApplicationSet controller will proceed to update the next group of Applications.
+- In addition, a best-effort, time-bounded [revision-aware hold](#revision-aware-step-gating) withholds a later group while an earlier group's `Healthy` is known to belong to a different revision. It reduces how often a group is released against a revision an earlier group has not applied; it is not a guarantee that every group is Healthy for the same revision.
 - The number of simultaneous Application updates in a group will not exceed its `maxUpdate` parameter (default is 100%, unbounded).
 - RollingSync will capture external changes outside the ApplicationSet resource, since it relies on watching the OutOfSync status of the managed Applications.
 - RollingSync will force all generated Applications to have autosync disabled. Warnings are printed in the applicationset-controller logs for any Application specs with an automated syncPolicy enabled.
