@@ -109,14 +109,24 @@ sync to a later reconciliation, once they have reported back. Applications that 
 revisions from different source coordinates, and Applications carrying an error that stops them
 reconciling at all, are not waited on.
 
-The wait is bounded at two minutes, measured from the earliest `Waiting` transition that recorded the
-change being waited on, so that Applications refreshing one after another cannot push the deadline out
-one refresh at a time. An Application that never consumes its refresh — because the Application
-controller is down, is not watching that namespace, or the Application belongs to a shard that is not
-running — carries no error condition and reports nothing new, so the controller cannot tell it apart
-from a refresh that is merely late. Past
-the bound the decision is taken on the state available and a warning is logged, rather than the
-rollout being held for as long as that lasts. While the decision is deferred the ApplicationSet is
+The wait is bounded at two minutes, and there are two levels to the bound because there can be more
+than one Application behind at once.
+
+*Per Application*, the deadline runs from the **oldest** observation that Application disagrees with —
+the earliest `Waiting` transition recording the change being waited on — so Applications refreshing one
+after another cannot push the deadline out one refresh at a time. If no such transition carries a
+timestamp at all the bound cannot be evaluated, and that Application is treated as **already past** it
+rather than as starting a fresh window; a wait whose end cannot be computed is not a bounded wait.
+
+*Across Applications*, the controller keeps waiting while **any** of them is still inside its own
+window, so one Application that has run out of time does not release a wave another is still
+legitimately waiting on.
+
+An Application that never consumes its refresh — because the Application controller is down, is not
+watching that namespace, or the Application belongs to a shard that is not running — carries no error
+condition and reports nothing new, so the controller cannot tell it apart from a refresh that is merely
+late. Once every outstanding wait has passed the bound, the decision is taken on the state available
+and a warning is logged, rather than the rollout being held for as long as that lasts. While the decision is deferred the ApplicationSet is
 re-examined every ten seconds; that poll is also what makes the wait recover on its own, because a
 pass that finds an Application already annotated patches nothing and so raises no event of its own.
 
