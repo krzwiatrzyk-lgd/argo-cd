@@ -131,6 +131,13 @@ later-step Applications whose observed revisions differ from the step being wait
 sibling Application entering `Waiting` as its own refresh lands mid-hold nor the order in which the
 Applications happen to be listed can move that deadline.
 
+If no such `Waiting` transition carries a timestamp at all, the wave is released immediately with a
+warning naming that reason, rather than a fresh two-minute window being started. Every code path that
+moves an Application into `Waiting` records the transition time, so this is not reachable through
+normal operation — but the gate is re-evaluated on every requeue, so deriving a new window each time
+would withhold the step forever. A hold whose end cannot be computed is not a bounded hold, and this
+gate blocks only on what it can prove.
+
 That bound matters when a commit does not touch an earlier step's
 [`manifest-generate-paths`](../high_availability.md#manifest-paths-annotation): the earlier
 step's Application is then never refreshed for that commit, and from the ApplicationSet controller this
