@@ -370,6 +370,9 @@ data:
   applicationsetcontroller.enable.git.submodule: "true"
   # Enables use of the Progressive Syncs capability
   applicationsetcontroller.enable.progressive.syncs: "false"
+  # Quiet period to wait after a progressive sync first observes a change before promoting any Application to Pending.
+  # 0 disables the wait. Requires applicationsetcontroller.enable.progressive.syncs. Maximum 5m.
+  applicationsetcontroller.progressive.sync.settle.window: "0"
   # A list of glob patterns specifying where to look for ApplicationSet resources. (default is only the ns where the controller is installed)
   applicationsetcontroller.namespaces: "argocd,argocd-appsets-*"
   # Path of the self-signed TLS certificate for SCM/PR Gitlab Generator

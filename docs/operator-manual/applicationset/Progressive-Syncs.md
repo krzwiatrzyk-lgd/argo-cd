@@ -96,6 +96,29 @@ Once each batch of Applications reaches a `Healthy` status, the next batch is sy
 
 If there are any applications that don't match the listed expressions, they will not be synced by the RollingSync strategy and must be manually synced as describe above.
 
+##### Settle Window
+
+The Application controller refreshes Applications independently, so when a new commit lands the ApplicationSet
+controller does not learn about it for every Application at the same instant. An Application it has not refreshed
+yet still reports the previous revision as `Synced` and `Healthy`, which can be read as "this step is done" and
+release the next step against a revision the earlier step has not applied.
+
+The settle window makes the controller wait for a quiet period after any Application registers a change before it
+promotes anything, so the decision is taken once the remaining Applications have had a chance to register the same
+change. It is configured in one of these ways.
+
+1. Pass `--progressive-sync-settle-window=5s` to the ApplicationSet controller args.
+1. Set `ARGOCD_APPLICATIONSET_CONTROLLER_PROGRESSIVE_SYNC_SETTLE_WINDOW=5s` in the ApplicationSet controller environment variables.
+1. Set `applicationsetcontroller.progressive.sync.settle.window: "5s"` in the Argo CD `argocd-cmd-params-cm` ConfigMap.
+
+The default is `0`, which disables the wait and keeps the existing behavior. The trade-off is latency: every
+rollout, including ones that were never at risk, is delayed by up to the configured window. A few seconds is
+normally enough. Under a burst of back-to-back commits the window keeps restarting, which is the intended debounce
+behavior but does mean the rollout waits for the burst to stop. This flag requires `--enable-progressive-syncs`.
+
+Values above `5m` set through the environment variable or the ConfigMap key are rejected with a warning and the
+default of `0` is used instead; the command-line flag is not bounded.
+
 ### Deletion Strategies
 
 The `deletionOrder` field controls the order in which applications are deleted when they are removed from the ApplicationSet. Available values:
