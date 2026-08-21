@@ -127,7 +127,8 @@ a problem.
 
 The hold is bounded at two minutes, measured from the affected later-step Application's `Waiting`
 transition — not from the most recent `Waiting` transition anywhere in the ApplicationSet, so that
-other Applications entering `Waiting` as their own refreshes land cannot push the bound out. That bound matters when a commit does not touch an earlier step's
+other Applications entering `Waiting` as their own refreshes land cannot push the bound out. That
+bound matters when a commit does not touch an earlier step's
 [`manifest-generate-paths`](../high_availability.md#manifest-paths-annotation): the earlier
 step's Application is then never refreshed for that commit, and from the ApplicationSet controller this
 is indistinguishable from a refresh that is merely late. Past the bound the step is released and a
